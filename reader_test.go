@@ -5,14 +5,15 @@ package dsv
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -417,66 +418,128 @@ func (l *loop) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// drop is a Handler that throws the records away.
-type drop struct{}
+// tally is a Handler that counts the records and fields of one worker and
+// adds them to the totals when it is closed.
+type tally struct {
+	records, fields           uint64
+	totalRecords, totalFields *uint64
+}
 
-func (drop) Record(row uint64, flat []byte, lengths []uint32) error {
+func (c *tally) Record(row uint64, flat []byte, lengths []uint32) error {
+	c.records++
+	c.fields += uint64(len(lengths))
 	return nil
 }
 
-func (drop) Close() error {
+func (c *tally) Close() error {
+	atomic.AddUint64(c.totalRecords, c.records)
+	atomic.AddUint64(c.totalFields, c.fields)
 	return nil
 }
 
-// BenchmarkReader_Run reads the rows of a fixture b.N times as one input and
-// drops the records. MB/s is the speed of cutting and splitting.
+// generateRows returns a header and about a mebibyte of comma separated rows
+// with the given number of columns: numbers, words, decimals, dates and text.
+// With enclosed every field is enclosed and the text holds a delimiter, a
+// doubled enclosure and a line break.
+func generateRows(columns int, enclosed bool) (header, rows []byte, count int) {
+	words := []string{"north", "south", "east", "west", "upper", "lower", "inner", "outer"}
+
+	field := func(b []byte, row, column int) []byte {
+		if enclosed {
+			b = append(b, '"')
+		}
+		switch column % 5 {
+		case 0:
+			b = strconv.AppendInt(b, int64(row*31+column), 10)
+		case 1:
+			b = append(b, words[(row+column)%len(words)]...)
+		case 2:
+			b = strconv.AppendInt(b, int64((row*7+column)%1000), 10)
+			b = append(b, '.')
+			b = strconv.AppendInt(b, int64(10+(row+column)%90), 10)
+		case 3:
+			b = append(b, "2021-08-"...)
+			b = strconv.AppendInt(b, int64(10+(row+column)%19), 10)
+		case 4:
+			b = append(b, words[row%len(words)]...)
+			if enclosed {
+				b = append(b, ", \"\"quoted\"\" and\nbroken "...)
+			} else {
+				b = append(b, " plain and whole "...)
+			}
+			b = append(b, words[column%len(words)]...)
+		}
+		if enclosed {
+			b = append(b, '"')
+		}
+		return b
+	}
+
+	for column := 0; column < columns; column++ {
+		if column != 0 {
+			header = append(header, ',')
+		}
+		header = append(header, 'c')
+		header = strconv.AppendInt(header, int64(column), 10)
+	}
+	header = append(header, '\n')
+
+	for len(rows) < 1024*1024 {
+		for column := 0; column < columns; column++ {
+			if column != 0 {
+				rows = append(rows, ',')
+			}
+			rows = field(rows, count, column)
+		}
+		rows = append(rows, '\n')
+		count++
+	}
+
+	return header, rows, count
+}
+
+// BenchmarkReader_Run reads generated rows b.N times as one input and counts
+// the records. MB/s is the speed of cutting and splitting.
 func BenchmarkReader_Run(b *testing.B) {
 	benchmarks := []struct {
-		name    string
-		fixture string
-		opts    []Option
+		name     string
+		columns  int
+		enclosed bool
+		opts     []Option
 	}{
-		{
-			name:    "pipe, enclosed, line breaks in fields",
-			fixture: "6f522d299731f73aad537914cfe0d68b.csv",
-		},
-		{
-			// no enclosure is ever found, so every record is searched for one
-			name:    "multi-byte delimiter, no enclosure",
-			fixture: "csvSample.512034.11822895.csv",
-		},
-		{
-			name:    "multi-byte delimiter, no enclosure, newline delimited",
-			fixture: "csvSample.512034.11822895.csv",
-			opts:    []Option{WithNewlineDelimited()},
-		},
+		{name: "enclosed/20 columns", columns: 20, enclosed: true},
+		{name: "enclosed/200 columns", columns: 200, enclosed: true},
+		// no enclosure is ever found, so every record is searched for one
+		{name: "no enclosure/20 columns", columns: 20},
+		{name: "no enclosure/200 columns", columns: 200},
+		{name: "no enclosure, newline delimited/20 columns", columns: 20, opts: []Option{WithNewlineDelimited()}},
+		{name: "no enclosure, newline delimited/200 columns", columns: 200, opts: []Option{WithNewlineDelimited()}},
 	}
 
 	for _, bb := range benchmarks {
 		b.Run(bb.name, func(b *testing.B) {
-			data, err := os.ReadFile(filepath.Join("tests", bb.fixture))
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			end := bytes.IndexByte(data, '\n') + 1
-			rows := data[end:]
-			if !bytes.HasSuffix(rows, []byte("\n")) {
-				rows = append(rows[:len(rows):len(rows)], '\n')
-			}
+			header, rows, count := generateRows(bb.columns, bb.enclosed)
 
 			b.SetBytes(int64(len(rows)))
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			r := NewReader(&loop{header: data[:end], rows: rows, times: b.N}, bb.opts...)
+			r := NewReader(&loop{header: header, rows: rows, times: b.N}, bb.opts...)
 			defer r.Close()
 
-			err = r.Run(func() (Handler, error) {
-				return drop{}, nil
+			var records, fields uint64
+			err := r.Run(func() (Handler, error) {
+				return &tally{totalRecords: &records, totalFields: &fields}, nil
 			})
 			if err != nil {
 				b.Fatal(err)
+			}
+
+			b.StopTimer()
+			wantRecords := uint64(count) * uint64(b.N)
+			if records != wantRecords || fields != wantRecords*uint64(bb.columns) {
+				b.Fatalf("Run() handed out %d records and %d fields, want %d and %d",
+					records, fields, wantRecords, wantRecords*uint64(bb.columns))
 			}
 		})
 	}
