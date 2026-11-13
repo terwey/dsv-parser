@@ -28,8 +28,11 @@ import (
 const (
 	defaultBufferSize = 16 * 1024 * 1024
 
-	// batchRecords is the most records one worker takes at a time.
-	batchRecords = 128
+	// A worker takes a batch at a time: up to batchRecords records, or fewer
+	// that hold batchBytes together. A small batch costs more to hand over
+	// than to split.
+	batchRecords = 4096
+	batchBytes   = 256 * 1024
 )
 
 // ErrClosed is returned by a Reader that was closed before its input ended.
@@ -131,8 +134,10 @@ type record struct {
 
 // batch is a run of records cut under one detection state.
 type batch struct {
-	blk   *block
-	recs  []record
+	blk  *block
+	recs []record
+	// size is the length of the records together
+	size  int
 	cfg   util.CharacterConfig
 	first uint64
 	seq   uint64
@@ -623,6 +628,7 @@ func (r *Reader) putBatch(b *batch) {
 		b.recs[i] = record{}
 	}
 	b.recs = b.recs[:0]
+	b.size = 0
 	r.batchPool.Put(b)
 }
 
@@ -741,7 +747,7 @@ func (r *Reader) sendHeader(names [][]byte) {
 // add appends a row to the current batch. A batch ends when it is full or the
 // detection state changed, so every row is split under the state it was cut in.
 func (r *Reader) add(data []byte, count, outside int) bool {
-	if r.cur != nil && (len(r.cur.recs) == batchRecords ||
+	if r.cur != nil && (len(r.cur.recs) == batchRecords || r.cur.size >= batchBytes ||
 		r.cur.cfg.Excel != r.p.Characters.Excel ||
 		!bytes.Equal(r.cur.cfg.Enclosure, r.p.Characters.Enclosure) ||
 		!bytes.Equal(r.cur.cfg.Delimiter, r.p.Characters.Delimiter)) {
@@ -754,7 +760,7 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 	if r.cur == nil {
 		b, _ := r.batchPool.Get().(*batch)
 		if b == nil {
-			b = &batch{recs: make([]record, 0, batchRecords)}
+			b = &batch{recs: make([]record, 0, 256)}
 		}
 		b.cfg = *r.p.Characters
 		b.blk = r.blk
@@ -765,6 +771,7 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 		r.cur = b
 	}
 	r.cur.recs = append(r.cur.recs, record{data: data, count: int32(count), outside: int32(outside)})
+	r.cur.size += len(data)
 	return true
 }
 

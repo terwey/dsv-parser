@@ -182,8 +182,8 @@ picks it up.
 - `Close` waits for a read of the input that is in flight. On an input that never returns, it does not return.
 - With `WithOrder()`, records that finish ahead of a slow batch wait in memory until that batch is done.
 - When records come close to the buffer size, a `Reader` holds up to five buffers per worker.
-- Without `WithOrder()`, `Read` hands records over in batches of up to 128. On an input that trickles in, a record
-  can wait for its batch to fill.
+- Records go to the workers in batches of up to 4096 records or 256 KiB. On an input that trickles in, a record can
+  wait for its batch to fill.
 - A record with a broken enclosure can split differently from one run to the next: the splitter that repairs
   unescaped delimiters keeps state between the records of one worker.
 - The record cutter panics with `stuck on chunking` when it cannot find the end of a record after 100 attempts, and
