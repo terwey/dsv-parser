@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2020 Yorick Terweijden
+// Copyright (c) 2026 Yorick Terweijden
 
 package dsv
 

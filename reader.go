@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2020 Yorick Terweijden
+// Copyright (c) 2026 Yorick Terweijden
 
 // Package dsv reads records from delimiter separated input, CSV included, that
 // does not follow RFC 4180: any delimiter or enclosure, detected when not
