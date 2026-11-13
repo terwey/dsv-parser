@@ -249,6 +249,20 @@ BenchmarkReader_Run/NoEnclosure/NewlineDelimited/20_columns-12                  
 BenchmarkReader_Run/NoEnclosure/NewlineDelimited/200_columns-12                   13082    90790 ns/op  11551.92 MB/s   44485 B/op 0 allocs/op
 ```
 
+### Against `encoding/csv`
+
+```sh
+go test -run '^$' -bench Builtin .
+```
+
+`BenchmarkBuiltin_Read` reads the same rows with Go's `encoding/csv`, which parses on one goroutine. Its cases are
+named `Rows/Options/columns` too:
+
+| Options | What is set |
+|---|---|
+| `Default` | Nothing. Every record is allocated, as with `ReadStrings`. |
+| `ReuseRecord` | `ReuseRecord`. A record is valid until the next `Read`, as with `Read`. |
+
 ## Tests
 
 ```sh
