@@ -121,3 +121,51 @@ func (c *Counts) Add(data []byte, delimiter, enclosure byte) {
 
 	c.Delimiters, c.Enclosures, c.Outside = delimiterCount, enclosureCount, outsideCount
 }
+
+// notPlainStart is 0 for a letter, a digit and white space, and 1 for every other byte.
+var notPlainStart = func() (table [256]byte) {
+	for c := 0; c < len(table); c++ {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c == ' ', c >= '\t' && c <= '\r':
+		default:
+			table[c] = 1
+		}
+	}
+	return table
+}()
+
+// PlainStart reports whether c is a letter, a digit or white space.
+func PlainStart(c byte) bool {
+	return notPlainStart[c] == 0
+}
+
+// PlainStarts reports whether every column of data, split at delimiter, is
+// empty or starts with a letter, a digit or white space.
+func PlainStarts(data []byte, delimiter byte) bool {
+	n := len(data)
+	if n == 0 {
+		return true
+	}
+	if data[0] != delimiter && notPlainStart[data[0]] != 0 {
+		return false
+	}
+
+	repeated := Repeat(delimiter)
+	for base := 0; base < n; base += 8 {
+		found := Equal(Word(data[base:]), repeated)
+		if n-base < 8 {
+			// the bytes Word filled up with are not data
+			found &= 1<<(8*uint(n-base)) - 1
+		}
+
+		for found != 0 {
+			start := base + bits.TrailingZeros64(found)>>3 + 1
+			found &= found - 1
+			if start < n && data[start] != delimiter && notPlainStart[data[start]] != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}

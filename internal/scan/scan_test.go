@@ -97,6 +97,31 @@ func TestWord(t *testing.T) {
 	}
 }
 
+func TestPlainStarts(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{name: "enclosed column", data: `1,"a",2`, want: false},
+		{name: "enclosed first column", data: `"a",b`, want: false},
+		{name: "enclosed last column", data: `aaaaaaaa,bbbbbbbb,'c'`, want: false},
+		{name: "question mark", data: `a,?b?`, want: false},
+		{name: "byte above ASCII", data: "a,\xc3\xa9", want: false},
+		{name: "letters, digits and white space", data: "a,1, b,\tc\n2,d", want: true},
+		{name: "empty columns", data: ",,a,,", want: true},
+		{name: "enclosure inside a column", data: `a"b",c'd'`, want: true},
+		{name: "empty", data: "", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PlainStarts([]byte(tt.data), ','); got != tt.want {
+				t.Errorf("PlainStarts() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func BenchmarkCounts_Add(b *testing.B) {
 	row := []byte(`"31","south","7.11","2021-08-13","north, ""quoted"" and whole upper","36","inner","42.16","2021-08-18","north, ""quoted"" and whole south"` + "\n")
 	var data []byte

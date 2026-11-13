@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/terwey/dsv-parser/internal/debug"
+	"github.com/terwey/dsv-parser/internal/scan"
 )
 
 func knownEnclosures() []Character {
@@ -45,43 +46,17 @@ func DetectEnclosure(data []byte) (Character, int) {
 	return detect(data, knownEnclosures())
 }
 
-// notPlainStart is 0 for the bytes a column can start with and never be taken
-// for enclosed, and 1 for every other byte: a letter or a digit is no
-// enclosure, and white space is skipped.
-var notPlainStart = func() (table [256]byte) {
-	for c := 0; c < len(table); c++ {
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		case c == ' ', c >= '\t' && c <= '\r':
-		default:
-			table[c] = 1
-		}
-	}
-	return table
-}()
-
-// isZero is 1 for a zero byte: isZero[a^b] is 1 when a equals b.
-var isZero = [256]byte{0: 1}
-
-// startsPlain reports whether every column of data starts with a byte that
-// notPlainStart holds 0 for.
+// startsPlain reports whether every column of data is empty or starts with a
+// letter, a digit or white space. A letter or a digit is no enclosure, and
+// white space is skipped: the search finds no enclosure in such data.
 func startsPlain(data []byte, delimiter Character) bool {
 	if len(delimiter) == 1 {
-		// no branch per byte: columns are short, a branch on the delimiter mispredicts
-		d := delimiter[0]
-		atStart := byte(1)
-		var found byte
-		for _, c := range data {
-			isDelimiter := isZero[c^d]
-			found |= atStart & notPlainStart[c] &^ isDelimiter
-			atStart = isDelimiter
-		}
-		return found == 0
+		return scan.PlainStarts(data, delimiter[0])
 	}
 
 	for len(data) != 0 {
 		end := bytes.Index(data, delimiter)
-		if end != 0 && notPlainStart[data[0]] != 0 {
+		if end != 0 && !scan.PlainStart(data[0]) {
 			return false
 		}
 		if end == -1 {

@@ -112,10 +112,12 @@ type CharacterConfig struct {
 	// searched is the length of the input, from the start of the data
 	// SplitCsvInput was last given, whose lines were searched for an enclosure
 	// and hold none. It ends after a line break and holds searchedLines lines.
-	// searchedEOL and searchedDelimiter are the line break and delimiter of
-	// that search.
+	// The first searchedPlain bytes of it are lines whose columns all start
+	// with a letter, a digit or white space. searchedEOL and searchedDelimiter
+	// are the line break and delimiter of that search.
 	searched          int
 	searchedLines     int
+	searchedPlain     int
 	searchedEOL       characters.Character
 	searchedDelimiter characters.Character
 }
@@ -352,11 +354,15 @@ func (c *CharacterConfig) moveSearched(in []byte, advance int) {
 
 	eol := c.searchedEOL
 	if advance > c.searched || len(eol) == 0 || advance < len(eol) || !bytes.Equal(in[advance-len(eol):advance], eol) {
-		c.searched, c.searchedLines = 0, 0
+		c.searched, c.searchedLines, c.searchedPlain = 0, 0, 0
 		return
 	}
 	c.searched -= advance
 	c.searchedLines -= bytes.Count(in[:advance], eol)
+	c.searchedPlain -= advance
+	if c.searchedPlain < 0 {
+		c.searchedPlain = 0
+	}
 }
 
 func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -519,7 +525,7 @@ findEolIndex:
 			if replaced := c.ReplaceBackslashEscapedEnclosure(in[:eolIndex]); len(replaced) == eolIndex {
 				copy(in, replaced)
 				// the lines searched for an enclosure are not the lines in the data anymore
-				c.searched, c.searchedLines = 0, 0
+				c.searched, c.searchedLines, c.searchedPlain = 0, 0, 0
 			}
 		}
 
@@ -809,7 +815,7 @@ func (c *CharacterConfig) endsField(after []byte) bool {
 }
 
 func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
-	cc.searched, cc.searchedLines = 0, 0
+	cc.searched, cc.searchedLines, cc.searchedPlain = 0, 0, 0
 	cc.detectDelimiterAndEnclosureInChunk(in, eolIndex)
 }
 
@@ -822,7 +828,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 	}
 
 	if !bytes.Equal(cc.searchedEOL, cc.EOL) || !bytes.Equal(cc.searchedDelimiter, cc.Delimiter) {
-		cc.searched, cc.searchedLines = 0, 0
+		cc.searched, cc.searchedLines, cc.searchedPlain = 0, 0, 0
 		cc.searchedEOL = cc.EOL
 		cc.searchedDelimiter = cc.Delimiter
 	}
@@ -841,23 +847,31 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			break
 		}
 		if tmpEolIndex+len(cc.EOL) > cc.searched {
-			// debug.Debug("passing data: %s", in[tmpStart:tmpEolIndex])
-			encl, enclDetectCount, occurence := characters.DetectEnclosureWithDelimiter(in[tmpStart:tmpEolIndex], cc.Delimiter)
-			if enclDetectCount > 0 {
-				cc.SetEnclosure(encl)
-				if debug.DebugLog {
-					debug.Debug("enclosure (%s) count: %d occurence: %d found in: \n+%s+", encl, enclDetectCount, occurence, in[tmpStart:tmpEolIndex])
-					// panic("yo")
+			// the search finds no enclosure in a line whose columns start plain
+			plain := len(cc.Delimiter) == 1 && scan.PlainStarts(in[tmpStart:tmpEolIndex], cc.Delimiter[0])
+			if !plain {
+				// debug.Debug("passing data: %s", in[tmpStart:tmpEolIndex])
+				encl, enclDetectCount, occurence := characters.DetectEnclosureWithDelimiter(in[tmpStart:tmpEolIndex], cc.Delimiter)
+				if enclDetectCount > 0 {
+					cc.SetEnclosure(encl)
+					if debug.DebugLog {
+						debug.Debug("enclosure (%s) count: %d occurence: %d found in: \n+%s+", encl, enclDetectCount, occurence, in[tmpStart:tmpEolIndex])
+						// panic("yo")
+					}
+					break
 				}
-				break
 			}
 			if complete && tmpStart == cc.searched {
+				if plain && tmpStart == cc.searchedPlain {
+					cc.searchedPlain = tmpEolIndex + len(cc.EOL)
+				}
 				cc.searched = tmpEolIndex + len(cc.EOL)
 				cc.searchedLines = i + 1
 			}
 		}
 		// maybe the header contains a newline inside an enclosure
-		if i == 1 {
+		// two lines whose columns start plain do so joined as well: nothing to find
+		if i == 1 && tmpEolIndex+len(cc.EOL) > cc.searchedPlain {
 			if debug.DebugLog {
 				debug.Debug("check enclosure on second line")
 			}
