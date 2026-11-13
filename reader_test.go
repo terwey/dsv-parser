@@ -437,15 +437,26 @@ func (c *tally) Close() error {
 	return nil
 }
 
+// form is the shape of generated rows.
+type form int
+
+const (
+	// plain rows have no enclosure and no delimiter or line break in a field
+	plain form = iota
+	// enclosedOneLine rows enclose every field; every fifth field holds a
+	// delimiter and a doubled enclosure
+	enclosedOneLine
+	// enclosed rows are enclosedOneLine rows with a line break in every fifth field
+	enclosed
+)
+
 // generateRows returns a header and about a mebibyte of comma separated rows
 // with the given number of columns: numbers, words, decimals, dates and text.
-// With enclosed every field is enclosed and the text holds a delimiter, a
-// doubled enclosure and a line break.
-func generateRows(columns int, enclosed bool) (header, rows []byte, count int) {
+func generateRows(columns int, f form) (header, rows []byte, count int) {
 	words := []string{"north", "south", "east", "west", "upper", "lower", "inner", "outer"}
 
 	field := func(b []byte, row, column int) []byte {
-		if enclosed {
+		if f != plain {
 			b = append(b, '"')
 		}
 		switch column % 5 {
@@ -462,14 +473,17 @@ func generateRows(columns int, enclosed bool) (header, rows []byte, count int) {
 			b = strconv.AppendInt(b, int64(10+(row+column)%19), 10)
 		case 4:
 			b = append(b, words[row%len(words)]...)
-			if enclosed {
-				b = append(b, ", \"\"quoted\"\" and\nbroken "...)
-			} else {
+			switch f {
+			case plain:
 				b = append(b, " plain and whole "...)
+			case enclosedOneLine:
+				b = append(b, ", \"\"quoted\"\" and whole "...)
+			case enclosed:
+				b = append(b, ", \"\"quoted\"\" and\nbroken "...)
 			}
 			b = append(b, words[column%len(words)]...)
 		}
-		if enclosed {
+		if f != plain {
 			b = append(b, '"')
 		}
 		return b
@@ -499,48 +513,61 @@ func generateRows(columns int, enclosed bool) (header, rows []byte, count int) {
 }
 
 // BenchmarkReader_Run reads generated rows b.N times as one input and counts
-// the records. MB/s is the speed of cutting and splitting.
+// the records. MB/s is the speed of cutting and splitting. The cases are
+// named Rows/Options/columns: the shape of the rows, and what the caller told
+// the Reader about them.
 func BenchmarkReader_Run(b *testing.B) {
+	comma, quote := []byte(","), []byte(`"`)
+
 	benchmarks := []struct {
-		name     string
-		columns  int
-		enclosed bool
-		opts     []Option
+		name string
+		form form
+		opts []Option
 	}{
-		{name: "enclosed/20 columns", columns: 20, enclosed: true},
-		{name: "enclosed/200 columns", columns: 200, enclosed: true},
-		// no enclosure is ever found, so every record is searched for one
-		{name: "no enclosure/20 columns", columns: 20},
-		{name: "no enclosure/200 columns", columns: 200},
-		{name: "no enclosure, newline delimited/20 columns", columns: 20, opts: []Option{WithNewlineDelimited()}},
-		{name: "no enclosure, newline delimited/200 columns", columns: 200, opts: []Option{WithNewlineDelimited()}},
+		// every field enclosed, line breaks inside fields
+		{name: "Enclosed/AutoDetect", form: enclosed},
+		{name: "Enclosed/DelimiterAndEnclosureSet", form: enclosed, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
+
+		// every field enclosed, no line break inside a field
+		{name: "EnclosedOneLine/AutoDetect", form: enclosedOneLine},
+		{name: "EnclosedOneLine/DelimiterAndEnclosureSet", form: enclosedOneLine, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
+		{name: "EnclosedOneLine/EnclosureSetNewlineDelimited", form: enclosedOneLine, opts: []Option{WithDelimiter(comma), WithEnclosure(quote), WithNewlineDelimited()}},
+
+		// no enclosure in the rows
+		// AutoDetect never finds an enclosure, so every record is searched for one
+		{name: "NoEnclosure/AutoDetect", form: plain},
+		{name: "NoEnclosure/EnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
+		{name: "NoEnclosure/NoEnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(nil)}},
+		{name: "NoEnclosure/NewlineDelimited", form: plain, opts: []Option{WithNewlineDelimited()}},
 	}
 
 	for _, bb := range benchmarks {
-		b.Run(bb.name, func(b *testing.B) {
-			header, rows, count := generateRows(bb.columns, bb.enclosed)
+		for _, columns := range []int{20, 200} {
+			b.Run(bb.name+"/"+strconv.Itoa(columns)+"_columns", func(b *testing.B) {
+				header, rows, count := generateRows(columns, bb.form)
 
-			b.SetBytes(int64(len(rows)))
-			b.ReportAllocs()
-			b.ResetTimer()
+				b.SetBytes(int64(len(rows)))
+				b.ReportAllocs()
+				b.ResetTimer()
 
-			r := NewReader(&loop{header: header, rows: rows, times: b.N}, bb.opts...)
-			defer r.Close()
+				r := NewReader(&loop{header: header, rows: rows, times: b.N}, bb.opts...)
+				defer r.Close()
 
-			var records, fields uint64
-			err := r.Run(func() (Handler, error) {
-				return &tally{totalRecords: &records, totalFields: &fields}, nil
+				var records, fields uint64
+				err := r.Run(func() (Handler, error) {
+					return &tally{totalRecords: &records, totalFields: &fields}, nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				b.StopTimer()
+				wantRecords := uint64(count) * uint64(b.N)
+				if records != wantRecords || fields != wantRecords*uint64(columns) {
+					b.Fatalf("Run() handed out %d records and %d fields, want %d and %d",
+						records, fields, wantRecords, wantRecords*uint64(columns))
+				}
 			})
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			b.StopTimer()
-			wantRecords := uint64(count) * uint64(b.N)
-			if records != wantRecords || fields != wantRecords*uint64(bb.columns) {
-				b.Fatalf("Run() handed out %d records and %d fields, want %d and %d",
-					records, fields, wantRecords, wantRecords*uint64(bb.columns))
-			}
-		})
+		}
 	}
 }
