@@ -556,8 +556,9 @@ func (r *Reader) work() {
 			for i := range b.recs {
 				size += len(b.recs[i].data)
 			}
-			if cap(res.flat) < size {
-				res.flat = make([]byte, 0, size)
+			// the splitter writes eight bytes at a time, up to seven past a field
+			if cap(res.flat) < size+8 {
+				res.flat = make([]byte, 0, size+8)
 			}
 
 			*sp.p.Characters = b.cfg
