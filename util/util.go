@@ -318,14 +318,23 @@ func countOutsideEnclosure(s []byte, sep, enclosure characters.Character) int {
 func FindEOLCharacter(in []byte) characters.Character {
 	// there is a chance that the header is LF and the rest of the file is CRLF
 	// the first line break decides: a CR followed by a LF is CRLF, a CR alone is CR, a LF is LF.
-	// Only in up to that line break is looked at, the rest of it can be megabytes.
-	first := bytes.IndexByte(in, characters.Character_LINE_FEED[0])
-	head := in
-	if first != -1 {
-		head = in[:first]
-	}
-	if cr := bytes.IndexByte(head, characters.Character_CARRIAGE_RETURN[0]); cr != -1 {
-		first = cr
+	// Only in up to that line break is looked at, the rest of it can be megabytes:
+	// it is searched a piece at a time, for the LF and then for a CR before it.
+	const piece = 1024
+
+	first := -1
+	for start := 0; start < len(in) && first == -1; start += piece {
+		end := start + piece
+		if end > len(in) {
+			end = len(in)
+		}
+		if lf := bytes.IndexByte(in[start:end], characters.Character_LINE_FEED[0]); lf != -1 {
+			end = start + lf
+			first = end
+		}
+		if cr := bytes.IndexByte(in[start:end], characters.Character_CARRIAGE_RETURN[0]); cr != -1 {
+			first = start + cr
+		}
 	}
 	if first == -1 {
 		return characters.Character_EMPTY
@@ -355,7 +364,7 @@ func (c *CharacterConfig) SplitCsvInput(in []byte, atEOF bool) (advance int, tok
 // has advanced. An advance that does not end on a line break of the search
 // leaves no line the search can be trusted for.
 func (c *CharacterConfig) moveSearched(in []byte, advance int) {
-	if advance == 0 {
+	if advance == 0 || c.searched == 0 {
 		return
 	}
 
@@ -409,16 +418,6 @@ func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, tok
 	var enclCounted, enclosureCount int
 	var outsideCounted int
 	var outsideCounts scan.Counts
-
-	// outsideCount is CountOutsideEnclosure of in[:eolIndex]
-	outsideCount := func() int {
-		if outsideCounted == 0 && !singleBytes(c.Delimiter, c.Enclosure) {
-			return CountOutsideEnclosure(in[:eolIndex], c.Delimiter, c.Enclosure)
-		}
-		outsideCounts.Add(in[outsideCounted:eolIndex], c.Delimiter[0], c.Enclosure[0])
-		outsideCounted = eolIndex
-		return outsideOrZero(outsideCounts)
-	}
 
 findEolIndex:
 	delimCounted, delimCount = 0, 0
@@ -610,7 +609,7 @@ findEolIndex:
 
 				if bytes.Contains(in[:eolIndex], []byte(`{`)) {
 					// massive slowdown but needed for files with embedded JSON
-					if c.DelimOutsideCounted = outsideCount(); c.DelimOutsideCounted != c.DelimiterCount {
+					if c.DelimOutsideCounted = c.countOutside(in[:eolIndex], &outsideCounted, &outsideCounts); c.DelimOutsideCounted != c.DelimiterCount {
 						goto moveindex
 					}
 				}
@@ -620,7 +619,7 @@ findEolIndex:
 			}
 
 			// it is possible that the delimiter appears within the enclosure
-			if c.DelimOutsideCounted = outsideCount(); c.DelimOutsideCounted == c.DelimiterCount {
+			if c.DelimOutsideCounted = c.countOutside(in[:eolIndex], &outsideCounted, &outsideCounts); c.DelimOutsideCounted == c.DelimiterCount {
 				if debug.DebugLog {
 					debug.LogData("[SplitCsvInput]CountOutsideEnclosure is the same as the DelimiterCount", in[:eolIndex], 40960)
 					debug.BreakMe()
@@ -754,6 +753,17 @@ findEolIndex:
 
 	// not enough bytes
 	return 0, nil, nil
+}
+
+// countOutside is CountOutsideEnclosure of record. The first counted bytes of
+// record are in counts already; it counts the rest into counts.
+func (c *CharacterConfig) countOutside(record []byte, counted *int, counts *scan.Counts) int {
+	if *counted == 0 && !singleBytes(c.Delimiter, c.Enclosure) {
+		return CountOutsideEnclosure(record, c.Delimiter, c.Enclosure)
+	}
+	counts.Add(record[*counted:], c.Delimiter[0], c.Enclosure[0])
+	*counted = len(record)
+	return outsideOrZero(*counts)
 }
 
 // strayEnclosure reports whether the open enclosure on the line ending at eolIndex has no
