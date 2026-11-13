@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/exp/slices"
@@ -359,6 +361,254 @@ func runAll(t *testing.T, r *Reader, workers int) [][]string {
 	return append([][]string{names}, into.records...)
 }
 
+// failAt is a Handler that fails on one row.
+type failAt struct {
+	row uint64
+}
+
+func (f failAt) Record(row uint64, flat []byte, lengths []uint32) error {
+	if row == f.row {
+		return errors.New("disk full")
+	}
+	return nil
+}
+
+func (f failAt) Close() error { return nil }
+
+func TestReader_Offset(t *testing.T) {
+	// many returns n records, each format filled in with its number
+	many := func(format string, n int) []string {
+		records := make([]string, n)
+		for i := range records {
+			records[i] = fmt.Sprintf(format, i)
+		}
+		return records
+	}
+
+	tests := []struct {
+		name string
+		// head is the header and the lines before it
+		head string
+		// records are whole records, each with its line ending
+		records []string
+		// tail is an unfinished record; the input ends in io.ErrUnexpectedEOF after it
+		tail string
+		opts []Option
+		// run reads with Run instead of Read
+		run bool
+		// failRow is the row the Handler of Run fails on
+		failRow uint64
+		// exact is set when Offset is past the last record delivered, not
+		// only at the end of a record
+		exact bool
+	}{
+		{
+			name:    "records across buffer refills",
+			head:    "id,name\n",
+			records: many("%d,foo\n", 200),
+			opts:    []Option{WithBufferSize(64), WithWorkers(4), WithOrder()},
+			exact:   true,
+		},
+		{
+			name:    "line break inside an enclosure",
+			head:    "id,text\n",
+			records: many("%d,\"two\nlines\"\n", 100),
+			opts:    []Option{WithBufferSize(64), WithWorkers(4), WithOrder()},
+			exact:   true,
+		},
+		{
+			// a CR at the end of a buffer is read as the line ending: terwey/dsv-parser#4
+			name:    "CRLF inside an enclosure",
+			head:    "id,text\r\n",
+			records: many("%d,\"two\r\nlines\"\r\n", 100),
+			opts:    []Option{WithWorkers(4), WithOrder()},
+			exact:   true,
+		},
+		{
+			name:    "last record without a line ending",
+			head:    "id,name\n",
+			records: []string{"1,foo\n", "2,bar"},
+			opts:    []Option{WithOrder()},
+			exact:   true,
+		},
+		{
+			name:    "header on the third line",
+			head:    "export 2020\n\nsheet 1\nid,name\n",
+			records: many("%d,foo\n", 50),
+			opts:    []Option{WithStart(3), WithBufferSize(64), WithOrder()},
+			exact:   true,
+		},
+		{
+			name:    "excluded column",
+			head:    "id,secret,name\n",
+			records: many("%d,x,foo\n", 50),
+			opts:    []Option{WithExclude(1), WithBufferSize(64), WithOrder()},
+			exact:   true,
+		},
+		{
+			name:    "stream cut inside an enclosure",
+			head:    "id,text\n",
+			records: many("%d,\"two\nlines\"\n", 100),
+			tail:    "100,\"two\nli",
+			opts:    []Option{WithBufferSize(64), WithWorkers(4), WithOrder()},
+			exact:   true,
+		},
+		{
+			name:    "unordered",
+			head:    "id,name\n",
+			records: many("%d,foo\n", 200),
+			opts:    []Option{WithBufferSize(64), WithWorkers(4)},
+		},
+		{
+			name:    "unordered stream cut",
+			head:    "id,name\n",
+			records: many("%d,foo\n", 200),
+			tail:    "200,fo",
+			opts:    []Option{WithBufferSize(64), WithWorkers(4)},
+		},
+		{
+			name:    "run",
+			head:    "id,name\n",
+			records: many("%d,foo\n", 200),
+			opts:    []Option{WithBufferSize(64), WithWorkers(4)},
+			run:     true,
+		},
+		{
+			name:    "run, stream cut",
+			head:    "id,name\n",
+			records: many("%d,foo\n", 200),
+			tail:    "200,fo",
+			opts:    []Option{WithBufferSize(64), WithWorkers(4)},
+			run:     true,
+		},
+		{
+			name:    "run, handler fails on row 30",
+			head:    "id,name\n",
+			records: many("%d,foo\n", 200),
+			opts:    []Option{WithBufferSize(64), WithWorkers(1)},
+			run:     true,
+			failRow: 30,
+			exact:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// ends[i] is the offset past the first i records
+			ends := []int64{int64(len(tt.head))}
+			for _, record := range tt.records {
+				ends = append(ends, ends[len(ends)-1]+int64(len(record)))
+			}
+			boundary := func(offset int64) bool {
+				_, found := slices.BinarySearch(ends, offset)
+				return found
+			}
+
+			var input io.Reader = strings.NewReader(tt.head + strings.Join(tt.records, "") + tt.tail)
+			if tt.tail != "" {
+				input = io.MultiReader(input, iotest.ErrReader(io.ErrUnexpectedEOF))
+			}
+			r := NewReader(input, tt.opts...)
+			defer r.Close()
+
+			// delivered counts the records delivered in input order
+			delivered := len(tt.records)
+			var err error
+			if tt.run {
+				err = r.Run(func() (Handler, error) {
+					return failAt{row: tt.failRow}, nil
+				})
+				if tt.failRow != 0 {
+					delivered = int(tt.failRow) - 1
+				}
+			} else {
+				previous := int64(0)
+				for i := -1; ; i++ {
+					if _, err = r.Read(); err != nil {
+						delivered = i
+						break
+					}
+					got := r.Offset()
+					if tt.exact && got != ends[i+1] {
+						t.Fatalf("Offset() after record %d = %d, want %d", i+1, got, ends[i+1])
+					}
+					if !boundary(got) || got < previous {
+						t.Fatalf("Offset() after record %d = %d, after %d: not the end of a later record", i+1, got, previous)
+					}
+					previous = got
+				}
+				if err == io.EOF {
+					err = nil
+				}
+			}
+
+			wantErr := tt.tail != "" || tt.failRow != 0
+			if (err != nil) != wantErr || (tt.tail != "" && !errors.Is(err, io.ErrUnexpectedEOF)) {
+				t.Fatalf("reading ended in %v, want an error: %t", err, wantErr)
+			}
+			got := r.Offset()
+			if !wantErr || tt.exact {
+				if got != ends[delivered] {
+					t.Errorf("Offset() at the end = %d, want %d", got, ends[delivered])
+				}
+			} else if !boundary(got) {
+				t.Errorf("Offset() at the end = %d, not the end of a record", got)
+			}
+		})
+	}
+}
+
+func TestProgress_deliver(t *testing.T) {
+	type delivery struct {
+		seq   uint64
+		end   int64
+		whole bool
+	}
+	tests := []struct {
+		name       string
+		deliveries []delivery
+		want       int64
+	}{
+		{
+			name:       "a batch ahead waits for the one before it",
+			deliveries: []delivery{{1, 20, true}},
+			want:       5,
+		},
+		{
+			name:       "batches out of order",
+			deliveries: []delivery{{2, 30, true}, {1, 20, true}, {0, 10, true}},
+			want:       30,
+		},
+		{
+			name:       "a batch delivered in part stops the batches after it",
+			deliveries: []delivery{{0, 8, false}, {1, 20, true}},
+			want:       8,
+		},
+		{
+			name:       "a batch ahead delivered in part",
+			deliveries: []delivery{{2, 30, true}, {1, 15, false}, {0, 10, true}},
+			want:       15,
+		},
+		{
+			name:       "no record of the batch delivered",
+			deliveries: []delivery{{0, 0, false}, {1, 20, true}},
+			want:       5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := progress{offset: 5}
+			for _, d := range tt.deliveries {
+				p.deliver(d.seq, d.end, d.whole)
+			}
+			if p.offset != tt.want {
+				t.Errorf("offset = %d, want %d", p.offset, tt.want)
+			}
+		})
+	}
+}
+
 // wantRecords reads the records a fixture holds: one JSON array of strings per
 // line, the header first, in input order.
 func wantRecords(t *testing.T, path string) [][]string {
@@ -663,5 +913,43 @@ func BenchmarkReader_ReadOneCPU(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// BenchmarkReader_ReadOffset is the NoEnclosure/NewlineDelimited/20_columns
+// case of BenchmarkReader_ReadOneCPU, the one with the most records per byte,
+// with Offset called after every Read.
+func BenchmarkReader_ReadOffset(b *testing.B) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	header, rows, count := generateRows(20, plain)
+
+	b.SetBytes(int64(len(rows)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	r := NewReader(&loop{header: header, rows: rows, times: b.N}, WithWorkers(1), WithNewlineDelimited())
+	defer r.Close()
+
+	records := 0
+	var offset int64
+	for {
+		_, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+		records++
+		offset = r.Offset()
+	}
+
+	b.StopTimer()
+	if want := count*b.N + 1; records != want {
+		b.Fatalf("Read() returned %d records, want %d", records, want)
+	}
+	if want := int64(len(header) + len(rows)*b.N); offset != want {
+		b.Fatalf("Offset() = %d, want %d", offset, want)
 	}
 }

@@ -81,6 +81,9 @@ type Reader struct {
 	cur           *batch
 	row           uint64
 	seq           uint64
+	// base is the input offset of the first byte of blk, headerEnd the offset
+	// past the line ending of the header
+	base, headerEnd int64
 
 	blockPool  sync.Pool
 	batchPool  sync.Pool
@@ -99,6 +102,8 @@ type Reader struct {
 
 	mu  sync.Mutex
 	err error
+
+	progress progress
 
 	// optErr is the option NewReader could not accept
 	optErr error
@@ -121,6 +126,7 @@ type header struct {
 	colCount       int
 	exclude        []int
 	keepLastColumn bool
+	end            int64
 }
 
 // block is one buffer of input. Records are slices of it, so it returns to the
@@ -133,6 +139,8 @@ type block struct {
 type record struct {
 	data           []byte
 	count, outside int32
+	// end is the input offset past the line ending of the record
+	end int64
 }
 
 // batch is a run of records cut under one detection state.
@@ -146,12 +154,73 @@ type batch struct {
 	seq   uint64
 }
 
+// end is the input offset past the last record of b.
+func (b *batch) end() int64 {
+	return b.recs[len(b.recs)-1].end
+}
+
 // result is one batch split into fields, for Read.
 type result struct {
 	seq    uint64
 	flat   []byte
 	lens   []uint32
 	fields []uint32
+	// ends holds the input offset past each record in fields, end that past
+	// the last record of the batch
+	ends []int64
+	end  int64
+}
+
+// progress is the input offset past the records delivered in input order.
+type progress struct {
+	mu     sync.Mutex
+	offset int64
+	// next is the sequence number of the first batch not delivered whole
+	next uint64
+	// ahead holds the batches after next that were delivered
+	ahead map[uint64]delivered
+	// stopped is set once a batch was delivered in part
+	stopped bool
+}
+
+type delivered struct {
+	end   int64
+	whole bool
+}
+
+// deliver records that the records of batch seq up to the input offset end
+// were delivered: every record of it when whole is true.
+func (p *progress) deliver(seq uint64, end int64, whole bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return
+	}
+	d := delivered{end: end, whole: whole}
+	if seq != p.next {
+		if p.ahead == nil {
+			p.ahead = make(map[uint64]delivered)
+		}
+		p.ahead[seq] = d
+		return
+	}
+
+	for {
+		if d.end > p.offset {
+			p.offset = d.end
+		}
+		if !d.whole {
+			p.stopped = true
+			return
+		}
+		p.next++
+		var ok bool
+		if d, ok = p.ahead[p.next]; !ok {
+			return
+		}
+		delete(p.ahead, p.next)
+	}
 }
 
 // Option configures a Reader.
@@ -301,6 +370,9 @@ func (r *Reader) Header() ([][]byte, error) {
 	})
 	r.headerOnce.Do(func() {
 		r.hdr = <-r.headerCh
+		if r.hdr != nil {
+			r.progress.offset = r.hdr.end
+		}
 	})
 
 	if r.hdr == nil {
@@ -384,6 +456,7 @@ func (r *Reader) Read() ([][]byte, error) {
 			if r.resRec < len(r.res.fields) {
 				return r.nextFields(), nil
 			}
+			r.progress.deliver(r.res.seq, r.res.end, true)
 			r.resultPool.Put(r.res)
 			r.res = nil
 		}
@@ -409,6 +482,27 @@ func (r *Reader) ReadStrings() ([]string, error) {
 		record[i] = string(fields[i])
 	}
 	return record, nil
+}
+
+// Offset returns the input offset, in bytes, just past the line ending of the
+// last record delivered with every record before it: the header, the lines
+// before it and the records up to that one. It is 0 before Header. A record is
+// delivered when Read returned it or, under Run, when Record returned nil for
+// it; a skipped record counts as delivered. Read with WithOrder delivers no
+// record past the offset; Read without it and Run can have.
+//
+// After an error, input io.ErrUnexpectedEOF included, the offset is still at
+// the end of a record: the input after it is the records not delivered in
+// order and the unfinished tail. Offset is safe to call from a Handler, not
+// concurrently with Read.
+func (r *Reader) Offset() int64 {
+	r.progress.mu.Lock()
+	defer r.progress.mu.Unlock()
+
+	if res := r.res; res != nil && r.resRec > 0 && !r.progress.stopped && res.seq == r.progress.next {
+		return res.ends[r.resRec-1]
+	}
+	return r.progress.offset
 }
 
 // Close stops the Reader and waits for its goroutines. It waits for a Read of
@@ -525,10 +619,16 @@ func (r *Reader) handle(h Handler) {
 				}
 				if err := h.Record(b.first+uint64(i), flat, lens); err != nil {
 					r.fail(err)
+					var end int64
+					if i > 0 {
+						end = b.recs[i-1].end
+					}
+					r.progress.deliver(b.seq, end, false)
 					r.putBatch(b)
 					return
 				}
 			}
+			r.progress.deliver(b.seq, b.end(), true)
 			r.putBatch(b)
 		}
 	}
@@ -557,8 +657,8 @@ func (r *Reader) work() {
 			if res == nil {
 				res = &result{}
 			}
-			res.seq = b.seq
-			res.flat, res.lens, res.fields = res.flat[:0], res.lens[:0], res.fields[:0]
+			res.seq, res.end = b.seq, b.end()
+			res.flat, res.lens, res.fields, res.ends = res.flat[:0], res.lens[:0], res.fields[:0], res.ends[:0]
 
 			size := 0
 			for i := range b.recs {
@@ -597,6 +697,7 @@ func (r *Reader) work() {
 					res.lens = append(res.lens, lens...)
 				}
 				res.fields = append(res.fields, uint32(len(lens)))
+				res.ends = append(res.ends, rec.end)
 			}
 			r.putBatch(b)
 
@@ -709,6 +810,7 @@ func (r *Reader) next() ([]byte, error) {
 			blk := r.getBlock()
 			n := copy(blk.buf, r.blk.buf[r.off:r.end])
 			r.releaseBlock(r.blk)
+			r.base += int64(r.off)
 			r.blk, r.off, r.end = blk, 0, n
 		}
 
@@ -746,6 +848,7 @@ func (r *Reader) sendHeader(names [][]byte) {
 		colCount:       r.split.colCount,
 		exclude:        append([]int(nil), r.p.Exclude...),
 		keepLastColumn: r.split.keepLastColumn,
+		end:            r.headerEnd,
 	}
 }
 
@@ -775,7 +878,7 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 		r.seq++
 		r.cur = b
 	}
-	r.cur.recs = append(r.cur.recs, record{data: data, count: int32(count), outside: int32(outside)})
+	r.cur.recs = append(r.cur.recs, record{data: data, count: int32(count), outside: int32(outside), end: r.base + int64(r.off)})
 	r.cur.size += len(data)
 	return true
 }

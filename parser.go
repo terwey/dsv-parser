@@ -711,6 +711,7 @@ func (r *Reader) record(token []byte) bool {
 			return true
 		}
 
+		r.headerEnd = r.base + int64(r.off)
 		r.split.excludeExisting(chunk)
 
 		// an unnamed last column is an Excel export only when the first row ends with a delimiter as well
