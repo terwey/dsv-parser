@@ -249,6 +249,15 @@ BenchmarkReader_Run/NoEnclosure/NewlineDelimited/20_columns-12                  
 BenchmarkReader_Run/NoEnclosure/NewlineDelimited/200_columns-12                   13082    90790 ns/op  11551.92 MB/s   44485 B/op 0 allocs/op
 ```
 
+### On one CPU
+
+```sh
+go test -run '^$' -bench OneCPU .
+```
+
+`BenchmarkReader_ReadOneCPU` runs the same cases with `WithWorkers(1)` and `GOMAXPROCS` set to 1, and takes the
+records from `Read`. This is the series to hold against `encoding/csv` with `ReuseRecord`.
+
 ### Against `encoding/csv`
 
 ```sh

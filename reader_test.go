@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -557,18 +558,18 @@ func generateRows(columns int, f form) (header, rows []byte, count int) {
 	return header, rows, count
 }
 
-// BenchmarkReader_Run reads generated rows b.N times as one input and counts
-// the records. MB/s is the speed of cutting and splitting. The cases are
-// named Rows/Options/columns: the shape of the rows, and what the caller told
-// the Reader about them.
-func BenchmarkReader_Run(b *testing.B) {
+// readerCase is a case of the Reader benchmarks: the shape of the rows, and
+// what the caller told the Reader about them.
+type readerCase struct {
+	name string
+	form form
+	opts []Option
+}
+
+func readerCases() []readerCase {
 	comma, quote := []byte(","), []byte(`"`)
 
-	benchmarks := []struct {
-		name string
-		form form
-		opts []Option
-	}{
+	return []readerCase{
 		// every field enclosed, line breaks inside fields
 		{name: "Enclosed/AutoDetect", form: enclosed},
 		{name: "Enclosed/DelimiterAndEnclosureSet", form: enclosed, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
@@ -585,8 +586,13 @@ func BenchmarkReader_Run(b *testing.B) {
 		{name: "NoEnclosure/NoEnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(nil)}},
 		{name: "NoEnclosure/NewlineDelimited", form: plain, opts: []Option{WithNewlineDelimited()}},
 	}
+}
 
-	for _, bb := range benchmarks {
+// BenchmarkReader_Run reads generated rows b.N times as one input and counts
+// the records. MB/s is the speed of cutting and splitting. The cases are
+// named Rows/Options/columns.
+func BenchmarkReader_Run(b *testing.B) {
+	for _, bb := range readerCases() {
 		for _, columns := range []int{20, 200} {
 			b.Run(bb.name+"/"+strconv.Itoa(columns)+"_columns", func(b *testing.B) {
 				header, rows, count := generateRows(columns, bb.form)
@@ -610,6 +616,49 @@ func BenchmarkReader_Run(b *testing.B) {
 				wantRecords := uint64(count) * uint64(b.N)
 				if records != wantRecords || fields != wantRecords*uint64(columns) {
 					b.Fatalf("Run() handed out %d records and %d fields, want %d and %d",
+						records, fields, wantRecords, wantRecords*uint64(columns))
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkReader_ReadOneCPU runs the cases of BenchmarkReader_Run with one
+// worker on one CPU, and takes the records from Read.
+func BenchmarkReader_ReadOneCPU(b *testing.B) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	for _, bb := range readerCases() {
+		for _, columns := range []int{20, 200} {
+			b.Run(bb.name+"/"+strconv.Itoa(columns)+"_columns", func(b *testing.B) {
+				header, rows, count := generateRows(columns, bb.form)
+				opts := append([]Option{WithWorkers(1)}, bb.opts...)
+
+				b.SetBytes(int64(len(rows)))
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				r := NewReader(&loop{header: header, rows: rows, times: b.N}, opts...)
+				defer r.Close()
+
+				var records, fields uint64
+				for {
+					record, err := r.Read()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+					records++
+					fields += uint64(len(record))
+				}
+
+				b.StopTimer()
+				// the header is a record here
+				wantRecords := uint64(count)*uint64(b.N) + 1
+				if records != wantRecords || fields != wantRecords*uint64(columns) {
+					b.Fatalf("Read() returned %d records and %d fields, want %d and %d",
 						records, fields, wantRecords, wantRecords*uint64(columns))
 				}
 			})
