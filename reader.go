@@ -371,7 +371,9 @@ func (r *Reader) Header() ([][]byte, error) {
 	r.headerOnce.Do(func() {
 		r.hdr = <-r.headerCh
 		if r.hdr != nil {
+			r.progress.mu.Lock()
 			r.progress.offset = r.hdr.end
+			r.progress.mu.Unlock()
 		}
 	})
 
@@ -493,8 +495,9 @@ func (r *Reader) ReadStrings() ([]string, error) {
 //
 // After an error, input io.ErrUnexpectedEOF included, the offset is still at
 // the end of a record: the input after it is the records not delivered in
-// order and the unfinished tail. Offset is safe to call from a Handler, not
-// concurrently with Read.
+// order and the unfinished tail. A Reader started on that input reads its first
+// record as the header. Offset is safe to call during Run, not concurrently
+// with Read.
 func (r *Reader) Offset() int64 {
 	r.progress.mu.Lock()
 	defer r.progress.mu.Unlock()
