@@ -157,6 +157,51 @@ func (e *endless) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// wholeRows is input that hands out whole rows only: a Read with room for
+// less than a row returns no bytes.
+type wholeRows struct {
+	header bool
+	rows   int
+}
+
+func (w *wholeRows) Read(p []byte) (int, error) {
+	if !w.header {
+		w.header = true
+		return copy(p, "id,name\n"), nil
+	}
+	if w.rows == 0 {
+		return 0, io.EOF
+	}
+	n := 0
+	for n+6 <= len(p) && w.rows > 0 {
+		n += copy(p[n:], "1,foo\n")
+		w.rows--
+	}
+	return n, nil
+}
+
+func TestRegressionReader_Read_shortBufferTail(t *testing.T) {
+	// the rows leave two bytes of the first buffer free, which wholeRows does not fill
+	const rows = 30000
+	r := NewReader(&wholeRows{rows: rows}, WithBufferSize(64*1024))
+	defer r.Close()
+
+	records := 0
+	for {
+		_, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read() after %d records: %s", records, err)
+		}
+		records++
+	}
+	if records != rows+1 {
+		t.Errorf("Read() returned %d records, want %d", records, rows+1)
+	}
+}
+
 func TestReader_Close_beforeEOF(t *testing.T) {
 	r := NewReader(&endless{}, WithBufferSize(64*1024))
 	for i := 0; i < 1000; i++ {

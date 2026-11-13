@@ -33,6 +33,9 @@ const (
 	// than to split.
 	batchRecords = 4096
 	batchBytes   = 256 * 1024
+
+	// blockTail is the free space at the end of a block the cutter does not read into.
+	blockTail = 4096
 )
 
 // ErrClosed is returned by a Reader that was closed before its input ended.
@@ -692,11 +695,13 @@ func (r *Reader) next() ([]byte, error) {
 			}
 		}
 
-		if r.end == len(r.blk.buf) {
-			if r.off == 0 {
-				return nil, fmt.Errorf("record exceeds the %d byte buffer, or the delimiter (%s) or enclosure (%s) is wrong: %w",
-					r.p.Buffersize, r.p.Characters.Delimiter, r.p.Characters.Enclosure, bufio.ErrTooLong)
-			}
+		free := len(r.blk.buf) - r.end
+		if free == 0 && r.off == 0 {
+			return nil, fmt.Errorf("record exceeds the %d byte buffer, or the delimiter (%s) or enclosure (%s) is wrong: %w",
+				r.p.Buffersize, r.p.Characters.Delimiter, r.p.Characters.Enclosure, bufio.ErrTooLong)
+		}
+		// a Read into the last bytes of a block gets little, and from some inputs nothing
+		if free == 0 || (r.off > 0 && free < blockTail && free < len(r.blk.buf)/2) {
 			// the records cut so far stay in the old block, the rest of it moves
 			if !r.flush() {
 				return nil, ErrClosed
