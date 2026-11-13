@@ -206,6 +206,20 @@ The second case is slow, the third is fast. As long as no enclosure is known the
 because a quote can first show up at row 200. A file without any pays for that search on every record.
 `WithNewlineDelimited()` and `WithEnclosure` switch the search off.
 
+On an Apple M2 Max:
+
+```
+goos: darwin
+goarch: arm64
+pkg: github.com/terwey/dsv-parser
+cpu: Apple M2 Max
+BenchmarkReader_Run/pipe,_enclosed,_line_breaks_in_fields-12                 8140        141747 ns/op    3063.85 MB/s       34293 B/op           0 allocs/op
+BenchmarkReader_Run/multi-byte_delimiter,_no_enclosure-12                       4     254635021 ns/op       3.14 MB/s    222889832 B/op     4830096 allocs/op
+BenchmarkReader_Run/multi-byte_delimiter,_no_enclosure,_newline_delimited-12                 7114        166270 ns/op    4815.17 MB/s       43995 B/op           0 allocs/op
+PASS
+ok      github.com/terwey/dsv-parser    6.512s
+```
+
 ## Tests
 
 ```sh
