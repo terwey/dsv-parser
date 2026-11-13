@@ -10,12 +10,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/exp/slices"
 
 	"github.com/terwey/dsv-parser/util"
 )
@@ -155,6 +158,51 @@ func (e *endless) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// wholeRows is input that hands out whole rows only: a Read with room for
+// less than a row returns no bytes.
+type wholeRows struct {
+	header bool
+	rows   int
+}
+
+func (w *wholeRows) Read(p []byte) (int, error) {
+	if !w.header {
+		w.header = true
+		return copy(p, "id,name\n"), nil
+	}
+	if w.rows == 0 {
+		return 0, io.EOF
+	}
+	n := 0
+	for n+6 <= len(p) && w.rows > 0 {
+		n += copy(p[n:], "1,foo\n")
+		w.rows--
+	}
+	return n, nil
+}
+
+func TestRegressionReader_Read_shortBufferTail(t *testing.T) {
+	// the rows leave two bytes of the first buffer free, which wholeRows does not fill
+	const rows = 30000
+	r := NewReader(&wholeRows{rows: rows}, WithBufferSize(64*1024))
+	defer r.Close()
+
+	records := 0
+	for {
+		_, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read() after %d records: %s", records, err)
+		}
+		records++
+	}
+	if records != rows+1 {
+		t.Errorf("Read() returned %d records, want %d", records, rows+1)
+	}
+}
+
 func TestReader_Close_beforeEOF(t *testing.T) {
 	r := NewReader(&endless{}, WithBufferSize(64*1024))
 	for i := 0; i < 1000; i++ {
@@ -218,7 +266,9 @@ func sortRows(records [][]string) {
 	if len(records) < 2 {
 		return
 	}
-	slices.SortFunc(records[1:], slices.Compare[[]string])
+	slices.SortFunc(records[1:], func(a, b []string) bool {
+		return slices.Compare(a, b) < 0
+	})
 }
 
 // collected is what the collectors of one Run received.
@@ -385,5 +435,233 @@ func TestReader_fixtures(t *testing.T) {
 				t.Errorf("Run() mismatch (-want +got):\n%.4000s", diff)
 			}
 		})
+	}
+}
+
+// loop is an input of a header followed by the same rows, times over.
+type loop struct {
+	header []byte
+	rows   []byte
+	times  int
+	rest   []byte
+}
+
+func (l *loop) Read(p []byte) (int, error) {
+	if len(l.rest) == 0 {
+		switch {
+		case l.header != nil:
+			l.rest, l.header = l.header, nil
+		case l.times > 0:
+			l.rest = l.rows
+			l.times--
+		default:
+			return 0, io.EOF
+		}
+	}
+
+	n := copy(p, l.rest)
+	l.rest = l.rest[n:]
+	return n, nil
+}
+
+// tally is a Handler that counts the records and fields of one worker and
+// adds them to the totals when it is closed.
+type tally struct {
+	records, fields           uint64
+	totalRecords, totalFields *uint64
+}
+
+func (c *tally) Record(row uint64, flat []byte, lengths []uint32) error {
+	c.records++
+	c.fields += uint64(len(lengths))
+	return nil
+}
+
+func (c *tally) Close() error {
+	atomic.AddUint64(c.totalRecords, c.records)
+	atomic.AddUint64(c.totalFields, c.fields)
+	return nil
+}
+
+// form is the shape of generated rows.
+type form int
+
+const (
+	// plain rows have no enclosure and no delimiter or line break in a field
+	plain form = iota
+	// enclosedOneLine rows enclose every field; every fifth field holds a
+	// delimiter and a doubled enclosure
+	enclosedOneLine
+	// enclosed rows are enclosedOneLine rows with a line break in every fifth field
+	enclosed
+)
+
+// generateRows returns a header and about a mebibyte of comma separated rows
+// with the given number of columns: numbers, words, decimals, dates and text.
+func generateRows(columns int, f form) (header, rows []byte, count int) {
+	words := []string{"north", "south", "east", "west", "upper", "lower", "inner", "outer"}
+
+	field := func(b []byte, row, column int) []byte {
+		if f != plain {
+			b = append(b, '"')
+		}
+		switch column % 5 {
+		case 0:
+			b = strconv.AppendInt(b, int64(row*31+column), 10)
+		case 1:
+			b = append(b, words[(row+column)%len(words)]...)
+		case 2:
+			b = strconv.AppendInt(b, int64((row*7+column)%1000), 10)
+			b = append(b, '.')
+			b = strconv.AppendInt(b, int64(10+(row+column)%90), 10)
+		case 3:
+			b = append(b, "2021-08-"...)
+			b = strconv.AppendInt(b, int64(10+(row+column)%19), 10)
+		case 4:
+			b = append(b, words[row%len(words)]...)
+			switch f {
+			case plain:
+				b = append(b, " plain and whole "...)
+			case enclosedOneLine:
+				b = append(b, ", \"\"quoted\"\" and whole "...)
+			case enclosed:
+				b = append(b, ", \"\"quoted\"\" and\nbroken "...)
+			}
+			b = append(b, words[column%len(words)]...)
+		}
+		if f != plain {
+			b = append(b, '"')
+		}
+		return b
+	}
+
+	for column := 0; column < columns; column++ {
+		if column != 0 {
+			header = append(header, ',')
+		}
+		header = append(header, 'c')
+		header = strconv.AppendInt(header, int64(column), 10)
+	}
+	header = append(header, '\n')
+
+	for len(rows) < 1024*1024 {
+		for column := 0; column < columns; column++ {
+			if column != 0 {
+				rows = append(rows, ',')
+			}
+			rows = field(rows, count, column)
+		}
+		rows = append(rows, '\n')
+		count++
+	}
+
+	return header, rows, count
+}
+
+// readerCase is a case of the Reader benchmarks: the shape of the rows, and
+// what the caller told the Reader about them.
+type readerCase struct {
+	name string
+	form form
+	opts []Option
+}
+
+func readerCases() []readerCase {
+	comma, quote := []byte(","), []byte(`"`)
+
+	return []readerCase{
+		// every field enclosed, line breaks inside fields
+		{name: "Enclosed/AutoDetect", form: enclosed},
+		{name: "Enclosed/DelimiterAndEnclosureSet", form: enclosed, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
+
+		// every field enclosed, no line break inside a field
+		{name: "EnclosedOneLine/AutoDetect", form: enclosedOneLine},
+		{name: "EnclosedOneLine/DelimiterAndEnclosureSet", form: enclosedOneLine, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
+		{name: "EnclosedOneLine/EnclosureSetNewlineDelimited", form: enclosedOneLine, opts: []Option{WithDelimiter(comma), WithEnclosure(quote), WithNewlineDelimited()}},
+
+		// no enclosure in the rows
+		// AutoDetect never finds an enclosure, so every record is searched for one
+		{name: "NoEnclosure/AutoDetect", form: plain},
+		{name: "NoEnclosure/EnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
+		{name: "NoEnclosure/NoEnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(nil)}},
+		{name: "NoEnclosure/NewlineDelimited", form: plain, opts: []Option{WithNewlineDelimited()}},
+	}
+}
+
+// BenchmarkReader_Run reads generated rows b.N times as one input and counts
+// the records. MB/s is the speed of cutting and splitting. The cases are
+// named Rows/Options/columns.
+func BenchmarkReader_Run(b *testing.B) {
+	for _, bb := range readerCases() {
+		for _, columns := range []int{20, 200} {
+			b.Run(bb.name+"/"+strconv.Itoa(columns)+"_columns", func(b *testing.B) {
+				header, rows, count := generateRows(columns, bb.form)
+
+				b.SetBytes(int64(len(rows)))
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				r := NewReader(&loop{header: header, rows: rows, times: b.N}, bb.opts...)
+				defer r.Close()
+
+				var records, fields uint64
+				err := r.Run(func() (Handler, error) {
+					return &tally{totalRecords: &records, totalFields: &fields}, nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				b.StopTimer()
+				wantRecords := uint64(count) * uint64(b.N)
+				if records != wantRecords || fields != wantRecords*uint64(columns) {
+					b.Fatalf("Run() handed out %d records and %d fields, want %d and %d",
+						records, fields, wantRecords, wantRecords*uint64(columns))
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkReader_ReadOneCPU runs the cases of BenchmarkReader_Run with one
+// worker on one CPU, and takes the records from Read.
+func BenchmarkReader_ReadOneCPU(b *testing.B) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	for _, bb := range readerCases() {
+		for _, columns := range []int{20, 200} {
+			b.Run(bb.name+"/"+strconv.Itoa(columns)+"_columns", func(b *testing.B) {
+				header, rows, count := generateRows(columns, bb.form)
+				opts := append([]Option{WithWorkers(1)}, bb.opts...)
+
+				b.SetBytes(int64(len(rows)))
+				b.ReportAllocs()
+				b.ResetTimer()
+
+				r := NewReader(&loop{header: header, rows: rows, times: b.N}, opts...)
+				defer r.Close()
+
+				var records, fields uint64
+				for {
+					record, err := r.Read()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+					records++
+					fields += uint64(len(record))
+				}
+
+				b.StopTimer()
+				// the header is a record here
+				wantRecords := uint64(count)*uint64(b.N) + 1
+				if records != wantRecords || fields != wantRecords*uint64(columns) {
+					b.Fatalf("Read() returned %d records and %d fields, want %d and %d",
+						records, fields, wantRecords, wantRecords*uint64(columns))
+				}
+			})
+		}
 	}
 }

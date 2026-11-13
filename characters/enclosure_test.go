@@ -1,6 +1,7 @@
 package characters
 
 import (
+	"math/rand"
 	"reflect"
 	"testing"
 
@@ -127,4 +128,66 @@ func Test_findRightOfPos(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_startsPlain(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      string
+		delimiter string
+		want      bool
+	}{
+		{name: "enclosed column", data: `1,"a",2`, delimiter: ",", want: false},
+		{name: "enclosed first column", data: `"a",b`, delimiter: ",", want: false},
+		{name: "enclosed last column", data: `a,b,'c'`, delimiter: ",", want: false},
+		{name: "question mark", data: `a,?b?`, delimiter: ",", want: false},
+		{name: "byte above ASCII", data: "a,\xc3\xa9", delimiter: ",", want: false},
+		{name: "enclosed column, multi-byte delimiter", data: `a<#>"b"`, delimiter: "<#>", want: false},
+		{name: "letters, digits and white space", data: "a,1, b,\tc\n2,d", delimiter: ",", want: true},
+		{name: "empty columns", data: ",,a,,", delimiter: ",", want: true},
+		{name: "enclosure inside a column", data: `a"b",c'd'`, delimiter: ",", want: true},
+		{name: "multi-byte delimiter", data: "a<#><#>b<#>", delimiter: "<#>", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := startsPlain([]byte(tt.data), Character(tt.delimiter)); got != tt.want {
+				t.Errorf("startsPlain() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// what startsPlain lets through, the search finds nothing in
+	t.Run("generated", func(t *testing.T) {
+		// runs of one letter or digit make the search take two and three bytes as the candidate
+		alphabets := []string{
+			"ab1 \t\n\r\"\"'*?-.{,,,;|\xc3\xa9",
+			"aaAA1100??  \v\f,,\"'",
+			"aZ09 ,,,?\"\"\"'*",
+		}
+		rng := rand.New(rand.NewSource(1))
+		plain := 0
+		for i := 0; i < 400000; i++ {
+			alphabet := alphabets[i%len(alphabets)]
+			data := make([]byte, 1+rng.Intn(48))
+			for j := range data {
+				data[j] = alphabet[rng.Intn(len(alphabet))]
+			}
+			delimiter := Character(",")
+			if i%4 == 0 {
+				delimiter = Character(",;")
+			}
+			if !startsPlain(data, delimiter) {
+				continue
+			}
+			plain++
+
+			char, count, occurence := detectEnclosureWithDelimiter(data, delimiter)
+			if len(char) != 0 || count != -1 || occurence != -1 {
+				t.Fatalf("detectEnclosureWithDelimiter(%q, %q) = %q, %d, %d, want nothing found", data, delimiter, char, count, occurence)
+			}
+		}
+		if plain < 1000 {
+			t.Fatalf("only %d generated inputs start plain", plain)
+		}
+	})
 }

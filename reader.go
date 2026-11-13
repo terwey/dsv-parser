@@ -28,8 +28,14 @@ import (
 const (
 	defaultBufferSize = 16 * 1024 * 1024
 
-	// batchRecords is the most records one worker takes at a time.
-	batchRecords = 128
+	// A worker takes a batch at a time: up to batchRecords records, or fewer
+	// that hold batchBytes together. A small batch costs more to hand over
+	// than to split.
+	batchRecords = 4096
+	batchBytes   = 256 * 1024
+
+	// blockTail is the free space at the end of a block the cutter does not read into.
+	blockTail = 4096
 )
 
 // ErrClosed is returned by a Reader that was closed before its input ended.
@@ -121,7 +127,7 @@ type header struct {
 // pool only when the cutter and every batch cut from it have released it.
 type block struct {
 	buf  []byte
-	refs atomic.Int32
+	refs int32
 }
 
 type record struct {
@@ -131,8 +137,10 @@ type record struct {
 
 // batch is a run of records cut under one detection state.
 type batch struct {
-	blk   *block
-	recs  []record
+	blk  *block
+	recs []record
+	// size is the length of the records together
+	size  int
 	cfg   util.CharacterConfig
 	first uint64
 	seq   uint64
@@ -556,8 +564,9 @@ func (r *Reader) work() {
 			for i := range b.recs {
 				size += len(b.recs[i].data)
 			}
-			if cap(res.flat) < size {
-				res.flat = make([]byte, 0, size)
+			// the splitter writes eight bytes at a time, up to seven past a field
+			if cap(res.flat) < size+8 {
+				res.flat = make([]byte, 0, size+8)
 			}
 
 			*sp.p.Characters = b.cfg
@@ -605,12 +614,12 @@ func (r *Reader) getBlock() *block {
 	if blk == nil {
 		blk = &block{buf: make([]byte, r.p.Buffersize)}
 	}
-	blk.refs.Store(1)
+	atomic.StoreInt32(&blk.refs, 1)
 	return blk
 }
 
 func (r *Reader) releaseBlock(blk *block) {
-	if blk.refs.Add(-1) == 0 {
+	if atomic.AddInt32(&blk.refs, -1) == 0 {
 		r.blockPool.Put(blk)
 	}
 }
@@ -618,8 +627,11 @@ func (r *Reader) releaseBlock(blk *block) {
 func (r *Reader) putBatch(b *batch) {
 	r.releaseBlock(b.blk)
 	b.blk = nil
-	clear(b.recs)
+	for i := range b.recs {
+		b.recs[i] = record{}
+	}
 	b.recs = b.recs[:0]
+	b.size = 0
 	r.batchPool.Put(b)
 }
 
@@ -683,11 +695,13 @@ func (r *Reader) next() ([]byte, error) {
 			}
 		}
 
-		if r.end == len(r.blk.buf) {
-			if r.off == 0 {
-				return nil, fmt.Errorf("record exceeds the %d byte buffer, or the delimiter (%s) or enclosure (%s) is wrong: %w",
-					r.p.Buffersize, r.p.Characters.Delimiter, r.p.Characters.Enclosure, bufio.ErrTooLong)
-			}
+		free := len(r.blk.buf) - r.end
+		if free == 0 && r.off == 0 {
+			return nil, fmt.Errorf("record exceeds the %d byte buffer, or the delimiter (%s) or enclosure (%s) is wrong: %w",
+				r.p.Buffersize, r.p.Characters.Delimiter, r.p.Characters.Enclosure, bufio.ErrTooLong)
+		}
+		// a Read into the last bytes of a block gets little, and from some inputs nothing
+		if free == 0 || (r.off > 0 && free < blockTail && free < len(r.blk.buf)/2) {
 			// the records cut so far stay in the old block, the rest of it moves
 			if !r.flush() {
 				return nil, ErrClosed
@@ -738,7 +752,7 @@ func (r *Reader) sendHeader(names [][]byte) {
 // add appends a row to the current batch. A batch ends when it is full or the
 // detection state changed, so every row is split under the state it was cut in.
 func (r *Reader) add(data []byte, count, outside int) bool {
-	if r.cur != nil && (len(r.cur.recs) == batchRecords ||
+	if r.cur != nil && (len(r.cur.recs) == batchRecords || r.cur.size >= batchBytes ||
 		r.cur.cfg.Excel != r.p.Characters.Excel ||
 		!bytes.Equal(r.cur.cfg.Enclosure, r.p.Characters.Enclosure) ||
 		!bytes.Equal(r.cur.cfg.Delimiter, r.p.Characters.Delimiter)) {
@@ -751,17 +765,18 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 	if r.cur == nil {
 		b, _ := r.batchPool.Get().(*batch)
 		if b == nil {
-			b = &batch{recs: make([]record, 0, batchRecords)}
+			b = &batch{recs: make([]record, 0, 256)}
 		}
 		b.cfg = *r.p.Characters
 		b.blk = r.blk
-		r.blk.refs.Add(1)
+		atomic.AddInt32(&r.blk.refs, 1)
 		b.first = r.row
 		b.seq = r.seq
 		r.seq++
 		r.cur = b
 	}
 	r.cur.recs = append(r.cur.recs, record{data: data, count: int32(count), outside: int32(outside)})
+	r.cur.size += len(data)
 	return true
 }
 

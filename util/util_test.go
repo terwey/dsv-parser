@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path"
 	"reflect"
@@ -358,9 +359,11 @@ func Benchmark_GenSplitClean(b *testing.B) {
 	var pos []uint32
 	in := []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI","2022-03-11T21:46:09N","9999-12-31T00:00:00N","9.89","9.89","","[{""exftqvytk_id"":""I007CCK"",""xfa_mswb"":""2021-08-15"",""gtctd"":""01"",""zpjlv"":""R"",""eamrd"":""35"",""xzdjwnv"":""1"",""bwjeamwtgug_mswb"":""2022-08-14""}]"`)
 	c := CharacterConfig{
-		Enclosure:       characters.Character_QUOTATION_MARK,
-		DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
-		EnclosureClean:  true,
+		Config: characters.Config{
+			Enclosure:       characters.Character_QUOTATION_MARK,
+			DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
+			EnclosureClean:  true,
+		},
 	}
 
 	b.ResetTimer()
@@ -379,9 +382,11 @@ var CleanerIn []byte = []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI"
 func Benchmark_Cleaner(b *testing.B) {
 	var out []byte
 	c := CharacterConfig{
-		Enclosure:       characters.Character_QUOTATION_MARK,
-		DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
-		EnclosureClean:  true,
+		Config: characters.Config{
+			Enclosure:       characters.Character_QUOTATION_MARK,
+			DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
+			EnclosureClean:  true,
+		},
 	}
 
 	b.ResetTimer()
@@ -2729,6 +2734,28 @@ Dxmq égdskkotjh","RQWFCLEM","YÊVURJNVH","SBTO","JTCLWCHPFKEÜEOG","AZVZMAIBMID
 			}
 		})
 	}
+
+	// a one byte delimiter and enclosure are counted eight bytes at a time; the
+	// count equals that of the search for characters of any length
+	t.Run("generated", func(t *testing.T) {
+		alphabet := []byte(`ab,,""` + "\n';")
+		rng := rand.New(rand.NewSource(1))
+		for i := 0; i < 200000; i++ {
+			data := make([]byte, rng.Intn(60))
+			for j := range data {
+				data[j] = alphabet[rng.Intn(len(alphabet))]
+			}
+			sep, enclosure := characters.Character_COMMA, characters.Character_QUOTATION_MARK
+			if i%4 == 0 {
+				sep, enclosure = characters.Character_SEMICOLON, characters.Character_APOSTROPHE
+			}
+
+			got := CountOutsideEnclosure(data, sep, enclosure)
+			if want := countOutsideEnclosure(data, sep, enclosure); got != want {
+				t.Fatalf("CountOutsideEnclosure(%q, %q, %q) = %d, want %d", data, sep, enclosure, got, want)
+			}
+		}
+	})
 }
 
 var CountOutsideEnclosureResult int

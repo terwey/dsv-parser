@@ -2,9 +2,13 @@ package dsv
 
 import (
 	"bytes"
+	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/exp/slices"
+
 	"github.com/terwey/dsv-parser/characters"
 	"github.com/terwey/dsv-parser/internal/debug"
 	"github.com/terwey/dsv-parser/util"
@@ -2893,4 +2897,116 @@ func Benchmark_GenSplitCharacterClean(b *testing.B) {
 
 	resultGenSplitBuf = v
 	resultGenSplitPos = pos
+}
+
+func Test_splitter_splitWholeRow(t *testing.T) {
+	plain := []string{"a", "12", "north", "x y", "", "7.5", "2021-08-10", "a\rb", "a\r\nb", "\r", "long enough to be copied in parts"}
+	whole := []string{`"a"`, `""`, `"a,b"`, `"say ""hi"""`, `"two` + "\n" + `lines"`, `"a` + "\r\n" + `b"`, `"a` + "\r" + `b"`, `""""`, `",,"`,
+		`"a field that is long enough, to be copied in parts"`}
+	broken := []string{`5"`, `"a"b`, `"open`, `close"`, ` "a"`, `"a" `, `"""`, `a"b"c`, `"`, `"a""`}
+
+	type config struct {
+		name      string
+		delimiter characters.Character
+		enclosure characters.Character
+		excel     bool
+	}
+	configs := []config{
+		{name: "enclosure", delimiter: characters.Character_COMMA, enclosure: characters.Character_QUOTATION_MARK},
+		{name: "no enclosure", delimiter: characters.Character_COMMA},
+		{name: "enclosure, Excel", delimiter: characters.Character_COMMA, enclosure: characters.Character_QUOTATION_MARK, excel: true},
+		{name: "semicolon and apostrophe", delimiter: characters.Character_SEMICOLON, enclosure: characters.Character_APOSTROPHE},
+	}
+
+	for _, cfg := range configs {
+		t.Run(cfg.name, func(t *testing.T) {
+			newTestSplitter := func() *splitter {
+				p := newParams()
+				p.Characters.SetDelimiter(cfg.delimiter)
+				p.Characters.SetEnclosure(cfg.enclosure)
+				p.Characters.Excel = cfg.excel
+				return newSplitter(p)
+			}
+			got, want := newTestSplitter(), newTestSplitter()
+
+			// the fields are written for a comma and a quotation mark
+			replacer := strings.NewReplacer(",", string(cfg.delimiter), `"`, string(cfg.enclosure))
+			if len(cfg.enclosure) == 0 {
+				replacer = strings.NewReplacer(",", string(cfg.delimiter))
+			}
+			fields := func(list []string) []string {
+				replaced := make([]string, len(list))
+				for i := range list {
+					replaced[i] = replacer.Replace(list[i])
+				}
+				return replaced
+			}
+			plain, whole, broken := fields(plain), fields(whole), fields(broken)
+			delimiter := cfg.delimiter[0]
+
+			rng := rand.New(rand.NewSource(1))
+			split := 0
+			for i := 0; i < 300000; i++ {
+				var row []byte
+				columns := 1 + rng.Intn(7)
+				for column := 0; column < columns; column++ {
+					if column != 0 {
+						row = append(row, delimiter)
+					}
+					switch n := rng.Intn(40); {
+					case n == 0:
+						row = append(row, broken[rng.Intn(len(broken))]...)
+					case n < 20:
+						row = append(row, whole[rng.Intn(len(whole))]...)
+					default:
+						row = append(row, plain[rng.Intn(len(plain))]...)
+					}
+				}
+
+				// the header has as many columns as the row, or one off
+				colCount := columns + []int{0, 0, 0, 0, 0, 0, -1, 1}[rng.Intn(8)]
+				if colCount == 0 {
+					colCount = 1
+				}
+				got.colCount, want.colCount = colCount, colCount
+
+				// the counts the cutter hands over, or none
+				count, outside := 0, 0
+				if rng.Intn(2) == 0 {
+					count = bytes.Count(row, cfg.delimiter)
+					if rng.Intn(2) == 0 {
+						outside = util.CountOutsideEnclosure(row, cfg.delimiter, cfg.enclosure)
+					}
+				}
+				data := row
+				if cfg.excel {
+					row = append(row, delimiter)
+					if count != 0 || outside != 0 {
+						count++
+						outside++
+					}
+					data = row[:len(row)-1]
+				}
+
+				gotOut, gotPos, ok := got.splitWholeRow(0, data, count, outside)
+				if !ok {
+					continue
+				}
+				split++
+
+				wantOut, wantPos := want.splitRow(0, data, count, outside, false)
+				if !bytes.Equal(gotOut, wantOut) || !slices.Equal(gotPos, wantPos) {
+					t.Fatalf("splitWholeRow(%q, %d columns, counts %d and %d)\n got %q %v\nwant %q %v",
+						data, colCount, count, outside, gotOut, gotPos, wantOut, wantPos)
+				}
+				// splitRow split it with a splitter that keeps no state and counts nothing
+				if want.inside || want.RowCounter != (RowCount{}) {
+					t.Fatalf("splitRow(%q) left inside = %v and RowCounter = %+v", data, want.inside, want.RowCounter)
+				}
+			}
+			if split < 50000 {
+				t.Fatalf("splitWholeRow split %d of 300000 rows", split)
+			}
+		})
+	}
 }

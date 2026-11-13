@@ -215,6 +215,16 @@ func (r *splitter) Clean(data []byte, prefix, suffix bool) []byte {
 // the scanner counted in data; zero for both means not counted. colCount zero
 // means the columns of the header.
 func (r *splitter) SplitRow(colCount int, data []byte, count, outsideCount int, self bool) (out []byte, pos []uint32) {
+	if !self {
+		if out, pos, ok := r.splitWholeRow(colCount, data, count, outsideCount); ok {
+			return out, pos
+		}
+	}
+	return r.splitRow(colCount, data, count, outsideCount, self)
+}
+
+// splitRow is SplitRow for every record: it tries one way to split after the other.
+func (r *splitter) splitRow(colCount int, data []byte, count, outsideCount int, self bool) (out []byte, pos []uint32) {
 	// we need to check first if inside the data the delimiter occurs
 	// we can count the amount of occurences of the delimiter and compare
 	// if that matches the amount we expect
