@@ -196,16 +196,31 @@ go test -run '^$' -bench Reader .
 ```
 
 `BenchmarkReader_Run` generates about a mebibyte of comma separated rows, feeds them to a `Reader` in a loop and
-counts the records. Its `MB/s` column is the speed of cutting and splitting, with one worker per CPU. The rows have 20
-or 200 columns of numbers, words, decimals, dates and text, in three forms:
+counts the records. Its `MB/s` column is the speed of cutting and splitting, with one worker per CPU.
 
-- **enclosed**: every field is enclosed, and every fifth field holds a delimiter, a doubled enclosure and a line break,
-- **no enclosure**: plain fields, read with detection on,
-- **no enclosure, newline delimited**: the same rows read with `WithNewlineDelimited()`.
+The cases are named `Rows/Options/columns`. The rows have 20 or 200 columns of numbers, words, decimals, dates and
+text, in three shapes:
 
-The second form is the slow one. As long as no enclosure is known the parser looks for one in every record, because a
-quote can first show up at row 200. A file without any pays for that search on every record.
-`WithNewlineDelimited()` and `WithEnclosure` switch the search off.
+| Rows | What they look like |
+|---|---|
+| `Enclosed` | Every field enclosed. Every fifth field holds a delimiter, a doubled enclosure and a line break. |
+| `EnclosedOneLine` | The same without the line break. |
+| `NoEnclosure` | Plain fields. |
+
+The options are what the caller tells the `Reader` about the rows:
+
+| Options | What is set |
+|---|---|
+| `AutoDetect` | Nothing. |
+| `DelimiterAndEnclosureSet` | `WithDelimiter(",")` and `WithEnclosure("\"")`. |
+| `EnclosureSetNewlineDelimited` | Both of those and `WithNewlineDelimited()`. |
+| `EnclosureSet` | `WithDelimiter(",")` and `WithEnclosure("\"")`, on rows that have no enclosure. |
+| `NoEnclosureSet` | `WithDelimiter(",")` and an empty `WithEnclosure`. |
+| `NewlineDelimited` | `WithNewlineDelimited()`. |
+
+`NoEnclosure/AutoDetect` is the slow one. As long as no enclosure is known the parser looks for one in every record,
+because a quote can first show up at row 200. A file without any pays for that search on every record. Each of the
+other three `NoEnclosure` cases switches the search off.
 
 ## Tests
 
