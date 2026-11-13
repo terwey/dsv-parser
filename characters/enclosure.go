@@ -25,8 +25,10 @@ func knownEnclosures() []Character {
 	}
 }
 
+var knownEnclosureList = knownEnclosures()
+
 func isKnownEnclosure(char Character) bool {
-	for _, known := range knownEnclosures() {
+	for _, known := range knownEnclosureList {
 		if bytes.Equal(known, char) && len(char) != 0 {
 			// debug.Debug("known: %s len: %d", char, len(char))
 			return true
@@ -72,6 +74,9 @@ func DetectEnclosureWithDelimiter(data []byte, delimiter Character) (Character, 
 
 	var left, right []byte
 	charSize := 1
+
+	// whether data holds {"", looked up when the first column asks
+	var jsonChecked, jsonEscaped bool
 loop:
 	for i := range cols {
 		if len(cols[i]) == 0 {
@@ -84,8 +89,7 @@ loop:
 			if len(cols[i]) < charSize {
 				continue loop
 			}
-			left = make([]byte, charSize)
-			copy(left, cols[i][0:charSize])
+			left = cols[i][0:charSize:charSize]
 			if !utf8.Valid(left) {
 				// not valid UTF
 				charSize++
@@ -108,15 +112,19 @@ loop:
 			// first check if the slice is maybe the same size as two times a char
 			if len(cols[i]) != len(left)*2 {
 				// check if left is a " and appears double in a JSON escaped
-				if !bytes.Contains(data, []byte(`{""`)) {
-					// check if the char appears multiple times
-					if doubleLeft := append(left, left...); bytes.HasPrefix(cols[i], doubleLeft) {
+				if !jsonChecked {
+					jsonEscaped = bytes.Contains(data, []byte(`{""`))
+					jsonChecked = true
+				}
+				if !jsonEscaped {
+					// check if the char appears multiple times; left is the start of the column
+					if n := len(left); bytes.HasPrefix(cols[i][n:], left) {
 						charSizeBuf := charSize
-						leftBuf := append([]byte{}, left...)
-						left = doubleLeft
+						single := left
+						left = cols[i][0 : 2*n : 2*n]
 						charSize *= 2
-						if tripleLeft := append(doubleLeft, leftBuf...); bytes.HasPrefix(cols[i], tripleLeft) {
-							left = tripleLeft
+						if bytes.HasPrefix(cols[i][2*n:], single) {
+							left = cols[i][0 : 3*n : 3*n]
 							charSize = charSizeBuf * 3
 						}
 					}
@@ -143,16 +151,14 @@ loop:
 			if debug.DebugLog {
 				debug.Debug("[DetectEnclosureWithDelimiter] prevLeft = +%s+ was a match for right = +%s+", prevLeft, right)
 			}
-			left = make([]byte, len(prevLeft))
-			copy(left, prevLeft)
+			left = prevLeft
 		}
 
 		if bytes.Equal(prevLeftKnown, right) {
 			if debug.DebugLog {
 				debug.Debug("[DetectEnclosureWithDelimiter] prevLeftKnown = +%s+ was a match for right = +%s+", prevLeft, right)
 			}
-			left = make([]byte, len(prevLeftKnown))
-			copy(left, prevLeftKnown)
+			left = prevLeftKnown
 		}
 
 		closed := len(left) > 0 && bytes.Equal(left, right)
@@ -169,7 +175,8 @@ loop:
 
 			// additional test to see if the data just occurs multiple times in the same column
 			// if so it CANNOT be an enclosure as it's NOT escaped
-			if bytes.Count(bytes.ReplaceAll(cols[i], append(left, left...), []byte("DOUBLE_QUOTE")), left) > 2 {
+			doubleLeft := append(left[:len(left):len(left)], left...)
+			if bytes.Count(bytes.ReplaceAll(cols[i], doubleLeft, []byte("DOUBLE_QUOTE")), left) > 2 {
 				continue
 			}
 
@@ -178,11 +185,12 @@ loop:
 				if debug.DebugLog {
 					debug.BreakMe()
 				}
-				count := bytes.Count(bytes.ReplaceAll(data, append(left, left...), []byte("DOUBLE_QUOTE")), left)
+				replaced := bytes.ReplaceAll(data, doubleLeft, []byte("DOUBLE_QUOTE"))
+				count := bytes.Count(replaced, left)
 				if count == 0 {
 					continue
 				}
-				escapedCount := bytes.Count(bytes.ReplaceAll(data, append(left, left...), []byte("DOUBLE_QUOTE")), []byte("DOUBLE_QUOTE"))
+				escapedCount := bytes.Count(replaced, []byte("DOUBLE_QUOTE"))
 				f = &Found{
 					char:         Character(left),
 					count:        count,
@@ -195,15 +203,13 @@ loop:
 		}
 
 		if len(left) > 0 {
-			prevLeft = make([]byte, len(left))
-			copy(prevLeft, left)
+			prevLeft = left
 
 			if isKnownEnclosure(left) {
 				if debug.DebugLog {
 					debug.Debug("[DetectEnclosureWithDelimiter] adding known: %s", left)
 				}
-				prevLeftKnown = make([]byte, len(left))
-				copy(prevLeftKnown, left)
+				prevLeftKnown = left
 			}
 		}
 
