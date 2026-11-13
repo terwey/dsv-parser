@@ -121,7 +121,7 @@ type header struct {
 // pool only when the cutter and every batch cut from it have released it.
 type block struct {
 	buf  []byte
-	refs atomic.Int32
+	refs int32
 }
 
 type record struct {
@@ -605,12 +605,12 @@ func (r *Reader) getBlock() *block {
 	if blk == nil {
 		blk = &block{buf: make([]byte, r.p.Buffersize)}
 	}
-	blk.refs.Store(1)
+	atomic.StoreInt32(&blk.refs, 1)
 	return blk
 }
 
 func (r *Reader) releaseBlock(blk *block) {
-	if blk.refs.Add(-1) == 0 {
+	if atomic.AddInt32(&blk.refs, -1) == 0 {
 		r.blockPool.Put(blk)
 	}
 }
@@ -618,7 +618,9 @@ func (r *Reader) releaseBlock(blk *block) {
 func (r *Reader) putBatch(b *batch) {
 	r.releaseBlock(b.blk)
 	b.blk = nil
-	clear(b.recs)
+	for i := range b.recs {
+		b.recs[i] = record{}
+	}
 	b.recs = b.recs[:0]
 	r.batchPool.Put(b)
 }
@@ -755,7 +757,7 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 		}
 		b.cfg = *r.p.Characters
 		b.blk = r.blk
-		r.blk.refs.Add(1)
+		atomic.AddInt32(&r.blk.refs, 1)
 		b.first = r.row
 		b.seq = r.seq
 		r.seq++

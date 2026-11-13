@@ -10,12 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/exp/slices"
 
 	"github.com/terwey/dsv-parser/util"
 )
@@ -218,7 +218,9 @@ func sortRows(records [][]string) {
 	if len(records) < 2 {
 		return
 	}
-	slices.SortFunc(records[1:], slices.Compare[[]string])
+	slices.SortFunc(records[1:], func(a, b []string) bool {
+		return slices.Compare(a, b) < 0
+	})
 }
 
 // collected is what the collectors of one Run received.

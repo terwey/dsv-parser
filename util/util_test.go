@@ -358,9 +358,11 @@ func Benchmark_GenSplitClean(b *testing.B) {
 	var pos []uint32
 	in := []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI","2022-03-11T21:46:09N","9999-12-31T00:00:00N","9.89","9.89","","[{""exftqvytk_id"":""I007CCK"",""xfa_mswb"":""2021-08-15"",""gtctd"":""01"",""zpjlv"":""R"",""eamrd"":""35"",""xzdjwnv"":""1"",""bwjeamwtgug_mswb"":""2022-08-14""}]"`)
 	c := CharacterConfig{
-		Enclosure:       characters.Character_QUOTATION_MARK,
-		DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
-		EnclosureClean:  true,
+		Config: characters.Config{
+			Enclosure:       characters.Character_QUOTATION_MARK,
+			DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
+			EnclosureClean:  true,
+		},
 	}
 
 	b.ResetTimer()
@@ -379,9 +381,11 @@ var CleanerIn []byte = []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI"
 func Benchmark_Cleaner(b *testing.B) {
 	var out []byte
 	c := CharacterConfig{
-		Enclosure:       characters.Character_QUOTATION_MARK,
-		DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
-		EnclosureClean:  true,
+		Config: characters.Config{
+			Enclosure:       characters.Character_QUOTATION_MARK,
+			DoubleEnclosure: characters.Character_QUOTATION_MARK_DOUBLE,
+			EnclosureClean:  true,
+		},
 	}
 
 	b.ResetTimer()
