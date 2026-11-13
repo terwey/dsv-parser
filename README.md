@@ -218,9 +218,9 @@ The options are what the caller tells the `Reader` about the rows:
 | `NoEnclosureSet` | `WithDelimiter(",")` and an empty `WithEnclosure`. |
 | `NewlineDelimited` | `WithNewlineDelimited()`. |
 
-`NoEnclosure/AutoDetect` is the slow one. As long as no enclosure is known the parser looks for one in every record,
-because a quote can first show up at row 200. A file without any pays for that search on every record. Each of the
-other three `NoEnclosure` cases switches the search off.
+`NoEnclosure/AutoDetect` is slower than the other three `NoEnclosure` cases. As long as no enclosure is known the
+parser looks for one in every record, because a quote can first show up at row 200. A file without any pays for that
+search on every record. Each of the other three cases switches the search off.
 
 ## Tests
 
