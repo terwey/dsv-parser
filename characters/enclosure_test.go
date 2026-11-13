@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/terwey/csv2sqlite/cmd/csv2sqlite/debug"
+	"github.com/terwey/dsv-parser/internal/debug"
 )
 
 func Test_findLeftOfPos(t *testing.T) {

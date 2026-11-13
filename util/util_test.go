@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/terwey/csv2sqlite/characters"
-	"github.com/terwey/csv2sqlite/cmd/csv2sqlite/debug"
+	"github.com/terwey/dsv-parser/characters"
+	"github.com/terwey/dsv-parser/internal/debug"
 )
 
 func getmulti() [][]byte {

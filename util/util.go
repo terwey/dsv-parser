@@ -8,12 +8,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"strings"
 	"unicode/utf8"
 
-	"github.com/spf13/pflag"
-	"github.com/terwey/csv2sqlite/characters"
-	"github.com/terwey/csv2sqlite/cmd/csv2sqlite/debug"
+	"github.com/terwey/dsv-parser/characters"
+	"github.com/terwey/dsv-parser/internal/debug"
 	"golang.org/x/exp/slices"
 )
 
@@ -1142,60 +1140,6 @@ func TrimSuffixSkipCheck(s, suffix []byte) []byte {
 
 func TrimPrefixSkipCheck(s, prefix []byte) []byte {
 	return s[len(prefix):]
-}
-
-type FlagUsage struct {
-	Name      string
-	Shorthand string
-	Default   string
-	Usage     string
-}
-
-func (f *FlagUsage) GetRow() string {
-	var s strings.Builder
-
-	s.WriteString("a| `--" + f.Name + "` ")
-	if f.Shorthand != "" {
-		s.WriteString("+ \n `-" + f.Shorthand + "`")
-	}
-	s.WriteString("\n")
-
-	s.WriteString("| " + f.Default + "\n")
-	s.WriteString("a| " + f.Usage + "\n")
-	s.WriteString("\n")
-
-	return s.String()
-}
-
-func (f *FlagUsage) GetMan() string {
-	var s strings.Builder
-
-	s.WriteString("*")
-	if f.Shorthand != "" {
-		s.WriteString("-" + f.Shorthand + ", ")
-	}
-	s.WriteString("--" + f.Name + "*:: \n")
-	s.WriteString("  " + f.Usage + "\n\n")
-
-	return s.String()
-}
-
-func Usage(flags *pflag.FlagSet) []FlagUsage {
-
-	var fu []FlagUsage
-
-	flags.VisitAll(func(flag *pflag.Flag) {
-		u := FlagUsage{
-			Name:      flag.Name,
-			Shorthand: flag.Shorthand,
-			Default:   flag.DefValue,
-			Usage:     flag.Usage,
-		}
-
-		fu = append(fu, u)
-	})
-
-	return fu
 }
 
 type DelimiterCounts struct {

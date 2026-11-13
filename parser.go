@@ -1,87 +1,54 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2020 Yorick Terweijden
 
-package parser
+package dsv
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/csv"
-	"fmt"
 	"io"
-	"log"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"golang.org/x/exp/slices"
-	"golang.org/x/term"
 
-	"github.com/schollz/progressbar/v3"
-	"github.com/terwey/csv2sqlite/characters"
-	"github.com/terwey/csv2sqlite/characters/knownconfigs"
-	"github.com/terwey/csv2sqlite/cmd/csv2sqlite/debug"
-	"github.com/terwey/csv2sqlite/util"
-	"github.com/terwey/recordwriter/recordwriter"
+	"github.com/terwey/dsv-parser/characters"
+	"github.com/terwey/dsv-parser/internal/debug"
+	"github.com/terwey/dsv-parser/util"
 )
 
+// RowCount counts the records a Reader could not split the regular way.
 type RowCount struct {
-	Inserted        uint64
-	GoParser        uint64
-	Dropped         uint64
+	// GoParser counts the records split by encoding/csv.
+	GoParser uint64
+	// Dropped counts the records no splitter could split; no Handler and no
+	// Read receives them.
+	Dropped uint64
+	// GoParserDropped counts the records encoding/csv returned an error for
+	// and no splitter could split afterwards.
 	GoParserDropped uint64
 }
 
-type Params struct {
-	Input  string
-	Output string
-
-	// the small SQLite files written are normally in the same
-	// target as the output file, for performance reasons (or
-	// storage reasons) a different workdir can be provided.
-	// e.g. a tmpfs ramdisk
-	Scratch string
-
+type params struct {
 	Characters *util.CharacterConfig
 
-	CommitRate      int
-	Buffersize      int
-	ChannelCapacity int
+	Buffersize int
 
 	// starting position of the CSV file
 	// this is needed for Excel to CSV exports
 	// that contain data above the header
-	Start           int
-	Skip            int // amount of rows to skip AFTER the header
-	Limit           int // maximum number of rows to process
-	CSVEnclosureSet int
+	Start int
 
 	Exclude []int
-
-	Sqlite bool
-	Drop   bool
 
 	// When set to true the CSV does not have newlines
 	// (CR, LF or CRLF) inside records
 	NewlineDelimited bool
-
-	// if the order of the incoming CSV matters the RowID
-	// can be set to true and during Scan the RowID will be added
-	RowID bool
 }
 
-func NewParameters() *Params {
-	p := &Params{
-		CommitRate: 32768,
+func newParams() *params {
+	p := &params{
 		Buffersize: 4096,
-		Input:      "",
-		Output:     "",
-
-		Limit: -1,
 	}
 
 	p.Characters = util.NewCharacterConfig(characters.Character_NIL, characters.Character_NIL)
@@ -89,7 +56,7 @@ func NewParameters() *Params {
 	return p
 }
 
-type Buffers struct {
+type buffers struct {
 	gpos     []uint32
 	sinput   [][]byte
 	sbuf     []byte
@@ -98,34 +65,17 @@ type Buffers struct {
 	lbBuffer bytes.Buffer
 }
 
-type Runtime struct {
-	p       *Params
-	reader  *bufio.Reader
-	rw      recordwriter.RecordWriter
-	f       io.Reader
-	fout    *os.File
-	scanner *bufio.Scanner
-	w       io.Writer
+// splitter splits one record into fields. Its results alias its buffers and
+// are valid until the next split.
+type splitter struct {
+	p *params
 
-	readbuf []byte
-	Header  [][]byte
-
-	HeaderSet   chan bool
-	Data        chan [][]byte
-	EmptyData   chan bool
-	StopWorkers chan bool
-
-	ProcessedHeader []string
-
-	splitFunc  bufio.SplitFunc
 	RowCounter RowCount
 
-	ParserCount int
-	colCount    int
+	colCount int
 
-	*Buffers
+	*buffers
 
-	headerPrinted      bool
 	inside             bool
 	hasPrefixEnclosure bool
 	hasSuffixEnclosure bool
@@ -134,28 +84,15 @@ type Runtime struct {
 	keepLastColumn bool
 }
 
-var (
-	RWDebugLog bool
-	Overflow   bool
-)
-
-func NewRuntime(p *Params, fn bufio.SplitFunc) *Runtime {
-	r := &Runtime{
-		p:             p,
-		headerPrinted: false,
-		splitFunc:     fn,
-		ParserCount:   0,
-		Buffers:       NewBuffers(),
+func newSplitter(p *params) *splitter {
+	return &splitter{
+		p:       p,
+		buffers: newBuffers(),
 	}
-
-	recordwriter.DebugLog = RWDebugLog
-	recordwriter.Overflow = Overflow
-
-	return r
 }
 
-func NewBuffers() *Buffers {
-	buf := &Buffers{
+func newBuffers() *buffers {
+	buf := &buffers{
 		gbuf: make([]byte, 0, 1*1024*1024),
 		gpos: make([]uint32, 0, 1024),
 		rbuf: make([]byte, 1*1024*1024),
@@ -164,286 +101,45 @@ func NewBuffers() *Buffers {
 	return buf
 }
 
-func NewParser(p *Params, parsercount int) *Runtime {
-	r := &Runtime{
-		p:             p,
-		headerPrinted: false,
-		ParserCount:   parsercount,
-	}
-
-	return r
-}
-
-func (r *Runtime) Merge(ready <-chan string, wg *sync.WaitGroup, duration chan time.Duration) {
-	// if sqlwriter, ok := r.rw.(*recordwriter.SQLiteWriter); ok {
-	r.rw.Merge(ready, wg, duration)
-	// }
-}
-
-func (r *Runtime) debug(format string, v ...any) {
-	debug.Debug("parser: "+format, v...)
-}
-
-func (r *Runtime) GetPath() string {
-	return r.rw.GetPath()
-}
-
-func (r *Runtime) GetWriter() io.Writer {
-	return r.w
-}
-
-func (r *Runtime) GetScanner() *bufio.Scanner {
-	return r.scanner
-}
-
-func (r *Runtime) Init(input io.Reader, buffers *Buffers) {
-	if input != nil {
-		r.f = input
-	}
-
-	r.Buffers = buffers
-
-	if r.ParserCount == 0 {
-		r.scanner = r.NewScanner()
-		r.Data = make(chan [][]byte, r.p.ChannelCapacity)
-		r.HeaderSet = make(chan bool)
-
-		r.EmptyData = make(chan bool)
-		r.StopWorkers = make(chan bool, r.p.ChannelCapacity)
-	}
-
-	r.rw = r.newRecordWriter(r.generateOutputPath())
-}
-
-func (r *Runtime) newRecordWriter(output string) recordwriter.RecordWriter {
-	if r.p.Drop {
-		return recordwriter.NewDropWriter()
-	}
-
-	if r.p.Sqlite {
-		return recordwriter.NewSQLWriter(output, r.p.CommitRate, r.ParserCount == 0, r.p.RowID)
-	}
-
-	if len(r.p.Output) == 0 {
-		r.w = os.Stdout
-	} else {
-		var err error
-		r.fout, err = os.Create(output)
-
-		if err != nil {
-			log.Fatalf("Cannot open file for writing: %s", err)
-		}
-		r.w = bufio.NewWriterSize(r.fout, r.p.CommitRate)
-	}
-
-	csv := recordwriter.NewCSVWriter(knownconfigs.CSV(), r.w, output)
-	csv.SetEnclosureSet(r.p.CSVEnclosureSet)
-	return csv
-}
-
-func (r *Runtime) generateOutputPath() string {
-	if r.ParserCount == 0 {
-		return r.p.Output
-	}
-
-	var output string
-	if r.p.Scratch != "" {
-		output = fmt.Sprintf("%s.%d", filepath.Join(r.p.Scratch, filepath.Base(r.p.Output)), r.ParserCount)
-	} else {
-		output = fmt.Sprintf("%s.%d", r.p.Output, r.ParserCount)
-	}
-	return output
-}
-
-func (r *Runtime) Close() error {
-	return r.CloseDB()
-}
-
-// CloseDB is only used for multi-threaded parsing
-func (r *Runtime) CloseDB() error {
-	var err error
-
-	if r.p.Sqlite {
-		return r.rw.Close()
-	}
-
-	if out, ok := r.GetWriter().(*bufio.Writer); ok {
-		if err = out.Flush(); err != nil {
-			log.Fatalf("Runtime: could not flush writer: %s", err)
-		}
-	}
-
-	if f, ok := r.w.(*os.File); ok {
-		if !term.IsTerminal(int(f.Fd())) {
-			log.Printf("sync: %s", r.GetPath())
-			f.Sync()
-		}
-	}
-
-	if len(r.p.Output) != 0 {
-		if err = r.fout.Sync(); err != nil {
-			log.Fatalf("Runtime: could not sync writer: %s", err)
-		}
-
-		return r.fout.Close()
-	}
-
-	return nil
-}
-
-func (r *Runtime) NewScanner() *bufio.Scanner {
-	r.readbuf = make([]byte, 0, r.p.Buffersize)
-
-	r.reader = bufio.NewReaderSize(r.f, r.p.Buffersize)
-
-	if _, err := io.ReadFull(r.reader, r.readbuf); err != nil && err != io.ErrUnexpectedEOF {
-		log.Fatalf("r.NewScanner(): %s", err)
-	}
-
-	scanner := bufio.NewScanner(r.reader)
-	scanner.Buffer(r.readbuf, r.p.Buffersize)
-	scanner.Split(r.splitFunc)
-
-	return scanner
-}
-
-func (r *Runtime) ParseRow(data []byte) (cols []byte, pos []uint32) {
-	if len(data) == 0 {
-		return []byte{}, []uint32{}
-	}
-
+// parseHeader splits the header line and names its unnamed columns: a line
+// break in a name is a space. It sets the column count the rows are split
+// against. The names alias the splitter's buffers.
+func (r *splitter) parseHeader(data []byte) [][]byte {
 	// replace CRLN/LN with space in header
-	if !r.headerPrinted {
-		data = bytes.ReplaceAll(data, characters.Character_CARRIAGE_RETURN_LINE_FEED, []byte(" "))
-		data = bytes.ReplaceAll(data, characters.Character_LINE_FEED, []byte(" "))
-	}
-	cols, pos = r.SplitRow(0, data, false)
+	data = bytes.ReplaceAll(data, characters.Character_CARRIAGE_RETURN_LINE_FEED, []byte(" "))
+	data = bytes.ReplaceAll(data, characters.Character_LINE_FEED, []byte(" "))
+	cols, pos := r.SplitRow(0, data, 0, 0, false)
 	if len(cols) == 0 {
-		return []byte{}, []uint32{}
+		return nil
 	}
-	// only rowid has been set, the header has no rowid
-	if r.p.RowID && r.headerPrinted && len(cols) == 1 {
-		return []byte{}, []uint32{}
+	header := util.FlatToMulti(cols, pos)
+
+	// we gotta check if the last column in the header is set, if not drop it
+	if len(header[len(header)-1]) == 0 && !r.keepLastColumn {
+		header = header[:len(header)-1]
+		r.p.Characters.Excel = true
 	}
-	if !r.headerPrinted {
-		if len(pos) == 1 {
-			log.Printf("Only 1 column for header found, make sure the delimiter is set properly.")
-		}
-		var header [][]byte
-		if r.p.RowID {
-			header = append(header, []byte("rowid"))
-		}
-		header = append(header, util.FlatToMulti(cols, pos)...)
 
-		// we gotta check if the last column in the header is set, if not drop it
-		if len(header[len(header)-1]) == 0 && !r.keepLastColumn {
-			header = header[:len(header)-1]
-			r.p.Characters.Excel = true
-		}
-
-		emptyCount := 1
-		for i := range header {
-			if len(header[i]) == 0 {
-				if emptyCount > 1 {
-					header[i] = []byte("empty_column__")
-					header[i] = strconv.AppendInt(header[i], int64(emptyCount), 10)
-				} else {
-					header[i] = []byte("empty_column")
-				}
-				emptyCount++
+	emptyCount := 1
+	for i := range header {
+		if len(header[i]) == 0 {
+			if emptyCount > 1 {
+				header[i] = []byte("empty_column__")
+				header[i] = strconv.AppendInt(header[i], int64(emptyCount), 10)
+			} else {
+				header[i] = []byte("empty_column")
 			}
-		}
-
-		r.ProcessHeader(header)
-		// we should not output the header to the sqlite file, return nothing as it'll be skipped
-		// return []byte{}, []uint32{}
-		return cols, pos
-	}
-
-	return cols, pos
-}
-
-func (r *Runtime) ProcessHeader(cols [][]byte) {
-	// we do not need to print the header multiple times for CSV
-	if _, ok := r.rw.(*recordwriter.CSVWriter); ok {
-		if r.ParserCount != 0 {
-			r.colCount = len(cols)
-			r.headerPrinted = true
-			return
-		}
-	}
-	if len(r.ProcessedHeader) != 0 {
-		if srw, ok := r.rw.(*recordwriter.SQLiteWriter); ok {
-			srw.SetProcessedHeader(r.ProcessedHeader)
+			emptyCount++
 		}
 	}
 
-	for i, col := range cols {
-		r.rw.WriteHeader(string(col))
-		if i != len(cols)-1 {
-			r.rw.Next()
-		}
-	}
-	if r.ParserCount == 0 {
-		r.Header = cols // needed for the second runtime
-		r.ProcessedHeader = r.rw.FinalizeHeader()
-		r.HeaderSet <- true
-	} else {
-		r.ProcessedHeader = r.rw.FinalizeHeader()
-	}
-	r.colCount = len(cols)
-	r.headerPrinted = true
-}
-
-func (r *Runtime) ProcessRow(v []byte, pos []uint32) {
-	if len(v) == 0 {
-		return
-	}
-
-	if r.p.RowID && PosSliceContainsNoValues(pos[1:]) {
-		return
-	}
-
-	// if r.p.RowID {
-	// TODO: if we want the rowid often, we need
-	// to be able to use the Ultra mode
-	// which requires the code to pass an integer
-	// to the sqlite C code
-	// 	// v, pos = util.RowIDToInteger(v, pos)
-	// }
-
-	if !r.p.RowID && debug.Ultra {
-		r.rw.Multibyte(v, pos, r.colCount)
-		r.RowCounter.Inserted++
-		r.rw.EORMulti()
-		return
-	}
-
-	cols := util.FlatToMulti(v, pos)
-	for i, col := range cols {
-		if len(col) == 0 {
-			r.rw.Skip()
-		} else {
-			if r.p.RowID && i == 0 {
-				r.rw.Write(string(col))
-				continue
-			}
-			r.rw.WriteByte(col)
-		}
-		if i != len(cols)-1 {
-			r.rw.Next()
-		}
-	}
-
-	r.RowCounter.Inserted++
-
-	r.rw.EOR(r.colCount)
-	return
+	r.colCount = len(header)
+	return header
 }
 
 // excludeExisting keeps the excluded columns the header has, each once and in order;
 // SplitRow expects every index in Exclude to remove exactly one column.
-func (r *Runtime) excludeExisting(header []byte) {
+func (r *splitter) excludeExisting(header []byte) {
 	if len(r.p.Exclude) == 0 {
 		return
 	}
@@ -461,7 +157,6 @@ func (r *Runtime) excludeExisting(header []byte) {
 	exclude := r.p.Exclude[:0]
 	for _, i := range r.p.Exclude {
 		if i < 0 || i >= columns {
-			log.Printf("Ignoring --exclude %d, the header has %d columns", i, columns)
 			continue
 		}
 		exclude = append(exclude, i)
@@ -469,29 +164,19 @@ func (r *Runtime) excludeExisting(header []byte) {
 	r.p.Exclude = exclude
 }
 
-func PosSliceContainsNoValues(pos []uint32) bool {
-	for _, v := range pos {
-		if v != 0 {
-			return false
-		}
-	}
-
-	return true
-}
-
-func (r *Runtime) genSplit(s, sep []byte, n int, fn util.CleanFunc, exclude []int) (data []byte, pos []uint32) {
+func (r *splitter) genSplit(s, sep []byte, n int, fn util.CleanFunc, exclude []int) (data []byte, pos []uint32) {
 	r.gbuf = r.gbuf[:0]
 	r.gpos = r.gpos[:0]
 	return util.GenSplitCore(s, sep, n, fn, exclude, r.gbuf, r.gpos)
 }
 
-func (r *Runtime) colSplitFlat(s []byte, sep characters.Character, enclosure characters.Character, n int, fn util.CleanFunc) (data []byte, pos []uint32) {
+func (r *splitter) colSplitFlat(s []byte, sep characters.Character, enclosure characters.Character, n int, fn util.CleanFunc) (data []byte, pos []uint32) {
 	r.gbuf = r.gbuf[:0]
 	r.gpos = r.gpos[:0]
 	return util.ColSplitFlatCore(s, sep, enclosure, n, fn, r.gbuf, r.gpos)
 }
 
-func (r *Runtime) Clean(data []byte, prefix, suffix bool) []byte {
+func (r *splitter) Clean(data []byte, prefix, suffix bool) []byte {
 	if r.p.Characters.Config.EnclosureClean && bytes.Contains(data, r.p.Characters.Config.Enclosure) {
 		// without prefix or suffix set, only a value wrapped on both ends is enclosed;
 		// a lone quote at either end, such as the inch mark in 55", is data
@@ -525,10 +210,11 @@ func (r *Runtime) Clean(data []byte, prefix, suffix bool) []byte {
 	return data
 }
 
-// SplitRow expects a byte slice appended with two counts appended to it in
-// binary encoded format in 32bit, e.g.  binary.LittleEndian.PutUint32(data, 0)
-// unless self is set to true
-func (r *Runtime) SplitRow(colCount int, data []byte, self bool) (out []byte, pos []uint32) {
+// SplitRow splits data into a flat record and the length of each field. count
+// and outsideCount are the delimiters, and the delimiters outside an enclosure,
+// the scanner counted in data; zero for both means not counted. colCount zero
+// means the columns of the header.
+func (r *splitter) SplitRow(colCount int, data []byte, count, outsideCount int, self bool) (out []byte, pos []uint32) {
 	// we need to check first if inside the data the delimiter occurs
 	// we can count the amount of occurences of the delimiter and compare
 	// if that matches the amount we expect
@@ -546,21 +232,9 @@ func (r *Runtime) SplitRow(colCount int, data []byte, self bool) (out []byte, po
 
 	lowestCount := colCount
 
-	var count, outsideCount int
 	provided := false
 
-	// we appended the delimiterCount to the chunk
-	// we must extract it and remove it, it's 4 bytes long
-
-	if !self {
-		// the incoming count is a delimiterCount and _not_ a columnCount
-
-		count, outsideCount = util.DecodeCounts(data[len(data)-8:])
-
-		// increment incoming by one due to previous count looked at delimiters
-		// and now we look at columns
-		data = data[:len(data)-8]
-	}
+	// the incoming count is a delimiterCount and _not_ a columnCount
 	if count != 0 || outsideCount != 0 {
 		provided = true
 	}
@@ -728,7 +402,7 @@ func (r *Runtime) SplitRow(colCount int, data []byte, self bool) (out []byte, po
 			debug.Debug("looping (sep: %s delim: %s) (r.colCount: %d lowestCount: %d): \n%s\n", r.p.Characters.Enclosure,
 				r.p.Characters.Delimiter, r.colCount, lowestCount, data)
 		}
-		return r.SplitRow(lowestCount+1, data, true)
+		return r.SplitRow(lowestCount+1, data, 0, 0, true)
 	}
 
 	if debug.DebugLog {
@@ -790,7 +464,7 @@ func delimiterInsideEnclosure(data []byte, delimiter, enclosure characters.Chara
 	}
 }
 
-func (r *Runtime) ParseUnescapedDelimiter(input [][]byte) (data []byte, pos []uint32) {
+func (r *splitter) ParseUnescapedDelimiter(input [][]byte) (data []byte, pos []uint32) {
 	cleanFunc := r.p.Characters.Clean
 	// NOTE: this method  doesn't work on optional enclosures.
 
@@ -965,228 +639,98 @@ func (r *Runtime) ParseUnescapedDelimiter(input [][]byte) (data []byte, pos []ui
 	return
 }
 
-func (r *Runtime) Parse(wg *sync.WaitGroup, chunkCount int, pv *progressbar.ProgressBar) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	var err error
-	// var buf []byte
-	var delimSet bool
-	var enclosureSet bool
-	if r.p.Characters.Delimiter != nil {
-		delimSet = true
-	}
-	if r.p.Characters.Enclosure != nil {
-		enclosureSet = true
-	}
-	if r.p.Characters.EnclosureIsEmpty {
-		enclosureSet = true
-	}
-	if r.p.Start > 1 {
-		r.p.Characters.ReturnEarly = true
+// record turns one cut record into the header or a row of the current batch.
+// It returns false when the Reader was closed. token is a slice of the current
+// block; nothing but a batch of that block may keep it.
+func (r *Reader) record(token []byte) bool {
+	if len(token) == 0 {
+		return true
 	}
 
-	scanner := r.GetScanner()
-
-	var chunks [][]byte
-	chunks = make([][]byte, 0, chunkCount)
-	var chunk []byte
-
-	var enclDetectCount int
-
-	// used for p.Start
-	startCounter := 1
-
-	// used for p.Skip
-	skipCounter := 0
-
-	count := 0
-
-	// used for storing the zeroed 8 delimiterCount
-	bdcZero := util.EncodeCounts(make([]byte, 8), 0, 0)
-
-	var rowIdBuf []byte
-
-	// a header ending with a delimiter waits for the first row
-	var pendingHeader []byte
-
-	// amount of bytes the chunksize is occupying
-	var chunksSize int
-	for scanner.Scan() {
-		if err = scanner.Err(); err != nil {
-			close(r.Data)
-			wg.Done()
-			log.Fatalf("Runtime: scanner error during loop: %s", err)
+	if r.p.Start > 1 && r.startCounter < r.p.Start {
+		if r.startCounter+1 == r.p.Start {
+			r.p.Characters.ReturnEarly = false
 		}
+		r.startCounter++
+		return true
+	}
 
-		size := len(scanner.Bytes())
-		if size == 0 {
-			continue
-		}
+	chunk := token
+	if r.p.Characters.Excel {
+		chunk = bytes.TrimSuffix(chunk, r.p.Characters.Delimiter)
+	}
+	// only clean the PHP characters in the scanner when using Nd
+	if r.p.NewlineDelimited && r.p.Characters.PHP {
+		chunk = r.p.Characters.ReplaceBackslashEscapedEnclosure(chunk)
+	}
+	// if no delimiter was set we detect it once
+	if !r.delimSet && len(r.p.Characters.Delimiter) == 0 {
+		r.p.Characters.SetDelimiter(characters.DetectDelimiter(chunk))
+	}
 
-		if r.p.Start > 1 && startCounter < r.p.Start {
-			if startCounter+1 == r.p.Start {
-				r.p.Characters.ReturnEarly = false
+	if !r.enclosureSet && len(r.p.Characters.Enclosure) == 0 {
+		prevCount := r.enclDetectCount
+		var encl characters.Character
+		encl, r.enclDetectCount, _ = characters.DetectEnclosureWithDelimiter(chunk, r.p.Characters.Delimiter)
+		if prevCount < r.enclDetectCount || r.enclDetectCount != -1 {
+			if debug.DebugLog {
+				debug.Debug("prevCount (%d) < enclDetectCount (%d): %s < %s", prevCount, r.enclDetectCount, r.p.Characters.Enclosure, encl)
 			}
-			startCounter++
-			continue
+			r.p.Characters.SetEnclosure(encl)
+		}
+		if r.p.Characters.DelimiterCount != 0 {
+			r.enclosureSet = true
+		}
+	}
+
+	// header has to be set once
+	if r.p.Characters.DelimiterCount == 0 {
+		// we have to count the delimiters in the header to know for row scanning
+		// how many fields we need
+		r.p.Characters.DelimiterCount = bytes.Count(chunk, r.p.Characters.Delimiter)
+		r.delimSet = true
+	}
+
+	// we have to process a header once
+	if !r.headerRead {
+		// a trim would have been sufficient but turns out some files have multiple
+		chunk = util.ReplaceAll(chunk, characters.BOM_UTF8, []byte{})
+
+		// some files have empty cols before the header, we should drop them, slight speed impact but worth the fix
+		if len(util.ReplaceAll(chunk, r.p.Characters.Delimiter, characters.Character_EMPTY)) == 0 {
+			return true
 		}
 
-		if r.p.Skip > 0 && count != 0 && skipCounter < r.p.Skip {
-			skipCounter++
-			if skipCounter <= r.p.Skip {
-				continue
-			}
+		r.split.excludeExisting(chunk)
+
+		// an unnamed last column is an Excel export only when the first row ends with a delimiter as well
+		if bytes.HasSuffix(chunk, r.p.Characters.Delimiter) {
+			r.pendingHeader = append([]byte(nil), chunk...)
+			r.headerRead = true
+			return true
 		}
 
-		if count != 0 && r.p.Limit == count-1 {
-			break
+		if names := r.split.parseHeader(chunk); names != nil {
+			r.headerRead = true
+			r.sendHeader(names)
 		}
+		return true
+	}
 
-		// make chunk large enough to also fit the delimCount as bytes
-		chunk = make([]byte, size, size+8)
-		copy(chunk, scanner.Bytes())
+	count, outside := r.p.Characters.DelimCounted, r.p.Characters.DelimOutsideCounted
+	// reset the count
+	r.p.Characters.DelimCounted = 0
+	r.p.Characters.DelimOutsideCounted = 0
 
-		chunksSize += size
+	if r.pendingHeader != nil {
+		r.split.keepLastColumn = !bytes.HasSuffix(chunk, r.p.Characters.Delimiter)
+		names := r.split.parseHeader(r.pendingHeader)
+		r.pendingHeader = nil
 		if r.p.Characters.Excel {
 			chunk = bytes.TrimSuffix(chunk, r.p.Characters.Delimiter)
 		}
-		// only clean the PHP characters in the scanner when using Nd
-		if r.p.NewlineDelimited && r.p.Characters.PHP {
-			chunk = r.p.Characters.ReplaceBackslashEscapedEnclosure(chunk)
-		}
-		// if no delimiter was set we detect it once
-		if !delimSet && len(r.p.Characters.Delimiter) == 0 {
-			r.p.Characters.SetDelimiter(characters.DetectDelimiter(chunk))
-		}
-
-		if !enclosureSet && len(r.p.Characters.Enclosure) == 0 {
-			prevCount := enclDetectCount
-			var encl characters.Character
-			encl, enclDetectCount, _ = characters.DetectEnclosureWithDelimiter(chunk, r.p.Characters.Delimiter)
-			if prevCount < enclDetectCount || enclDetectCount != -1 {
-				if debug.DebugLog {
-					debug.Debug("prevCount (%d) < enclDetectCount (%d): %s < %s", prevCount, enclDetectCount, r.p.Characters.Enclosure, encl)
-				}
-				r.p.Characters.SetEnclosure(encl)
-			}
-			if r.p.Characters.DelimiterCount != 0 {
-				enclosureSet = true
-			}
-		}
-
-		// header has to be set once
-		if r.p.Characters.DelimiterCount == 0 {
-			// we have to count the delimiters in the header to know for row scanning
-			// how many fields we need
-			r.p.Characters.DelimiterCount = bytes.Count(chunk, r.p.Characters.Delimiter)
-			delimSet = true
-		}
-
-		// we have to process a header once
-		if count == 0 {
-			// a trim would have been sufficient but turns out some files have multiple
-			chunk = util.ReplaceAll(chunk, characters.BOM_UTF8, []byte{})
-
-			// some files have empty cols before the header, we should drop them, slight speed impact but worth the fix
-			if len(util.ReplaceAll(chunk, r.p.Characters.Delimiter, characters.Character_EMPTY)) == 0 {
-				continue
-			}
-
-			r.excludeExisting(chunk)
-
-			// an unnamed last column is an Excel export only when the first row ends with a delimiter as well
-			if bytes.HasSuffix(chunk, r.p.Characters.Delimiter) {
-				pendingHeader = chunk
-				count++
-				continue
-			}
-
-			chunk = append(chunk, bdcZero...)
-			c, _ := r.ParseRow(chunk)
-			if len(c) != 0 {
-				count++
-			}
-			continue
-		}
-
-		if pendingHeader != nil {
-			r.keepLastColumn = !bytes.HasSuffix(chunk, r.p.Characters.Delimiter)
-			r.ParseRow(append(pendingHeader, bdcZero...))
-			pendingHeader = nil
-			if r.p.Characters.Excel {
-				chunk = bytes.TrimSuffix(chunk, r.p.Characters.Delimiter)
-			}
-		}
-
-		if len(chunks) >= chunkCount {
-			r.Data <- chunks
-			pv.Add(chunksSize)
-			chunksSize = 0
-			chunks = make([][]byte, 0, chunkCount)
-		}
-
-		if r.p.RowID {
-			// we have to make this a user configurable switch
-			rowIdBuf = append(rowIdBuf, []byte(strconv.Itoa(count))...)
-			rowIdBuf = append(rowIdBuf, r.p.Characters.Delimiter...)
-			chunk = append(rowIdBuf, chunk...)
-			rowIdBuf = make([]byte, 0)
-		}
-
-		if r.p.Characters.DelimCounted != 0 || r.p.Characters.DelimOutsideCounted != 0 {
-			// when we use a rowid we must increase it with one as we added it
-			if r.p.RowID {
-				if r.p.Characters.DelimCounted != 0 {
-					r.p.Characters.DelimCounted++
-				}
-				if r.p.Characters.DelimOutsideCounted != 0 {
-					r.p.Characters.DelimOutsideCounted++
-				}
-			}
-			chunk = append(chunk, util.EncodeCounts(make([]byte, 8), uint32(r.p.Characters.DelimCounted), uint32(r.p.Characters.DelimOutsideCounted))...)
-			// reset the count
-			r.p.Characters.DelimCounted = 0
-			r.p.Characters.DelimOutsideCounted = 0
-		} else {
-			chunk = append(chunk, bdcZero...)
-		}
-
-		chunks = append(chunks, chunk)
-		count++
+		r.sendHeader(names)
 	}
 
-	if err = scanner.Err(); err != nil {
-		close(r.Data)
-		wg.Done()
-		if err == bufio.ErrTooLong {
-			fmt.Fprintf(os.Stderr, "This error could also occur due to incorrectly configured delimiter (%s) or enclosure (%s)\n", r.p.Characters.Delimiter, r.p.Characters.Enclosure)
-			fmt.Fprintf(os.Stderr, "Scanner error (%s), try increasing the `--buffer-size` (current value: %d kb)\n", err, r.p.Buffersize/1024)
-			os.Exit(1)
-		} else {
-			log.Fatalf("Runtime: scanner error after loop: %s", err)
-		}
-	}
-
-	// a file without rows keeps the Excel reading of a header ending with a delimiter
-	if pendingHeader != nil {
-		r.ParseRow(append(pendingHeader, bdcZero...))
-	}
-
-	if len(chunks) != 0 {
-		// send over the last chunks
-		r.Data <- chunks
-		chunks = make([][]byte, 0)
-	}
-
-	close(r.Data)
-	// there was no data, tell the workers to not initialize
-	if count == 0 {
-		r.HeaderSet <- false
-	}
-	// when count is one, it was still empty, but stop the workers
-	if count == 1 {
-		r.StopWorkers <- true
-	}
-	pv.Finish()
-	wg.Done()
+	return r.add(chunk, count, outside)
 }

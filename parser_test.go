@@ -1,25 +1,20 @@
-package parser
+package dsv
 
 import (
-	"bufio"
 	"bytes"
-	"log"
-	"os"
-	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/schollz/progressbar/v3"
-	"github.com/terwey/csv2sqlite/characters"
-	"github.com/terwey/csv2sqlite/cmd/csv2sqlite/debug"
-	"github.com/terwey/csv2sqlite/util"
+	"github.com/terwey/dsv-parser/characters"
+	"github.com/terwey/dsv-parser/internal/debug"
+	"github.com/terwey/dsv-parser/util"
 )
 
 func Benchmark_SplitUnescapedDelimiter(b *testing.B) {
 
-	p := NewParameters()
+	p := newParams()
 	p.Characters.SetDelimiter(characters.Character_PIPE)
-	r := NewRuntime(p, bufio.ScanLines)
+	r := newSplitter(p)
 
 	testData := GetTests()
 
@@ -2688,12 +2683,11 @@ func TestSplitRow(t *testing.T) {
 			if tt.debug {
 				t.Logf("debug: %s", tt.name)
 			}
-			p := NewParameters()
+			p := newParams()
 			p.Characters.SetDelimiter(tt.delimiter)
 			p.Characters.SetEnclosure(tt.enclosure)
 			p.Exclude = tt.exclude
-			r := NewRuntime(p, bufio.ScanLines)
-			r.Buffers = NewBuffers()
+			r := newSplitter(p)
 			if tt.colcount != 0 {
 				r.colCount = tt.colcount
 			} else {
@@ -2704,9 +2698,7 @@ func TestSplitRow(t *testing.T) {
 
 			t.Logf("Name: %s, Colcount: %d (want: %d)", tt.name, r.colCount, len(tt.want))
 
-			// SplitRow expects a count appended to the data set, must be 32bit encoded
-			data := append(tt.args.data, util.EncodeCounts(make([]byte, 8), 0, 0)...)
-			if got := util.FlatToMulti(r.SplitRow(0, data, false)); !cmp.Equal(got, tt.want) {
+			if got := util.FlatToMulti(r.SplitRow(0, tt.args.data, 0, 0, false)); !cmp.Equal(got, tt.want) {
 				// if got := util.FlatToMulti(r.ParseUnescapedDelimiter(util.ColSplit(tt.args.data, p.Characters.Delimiter, p.Characters.Enclosure, -1))); !cmp.Equal(got, tt.want) {
 				if len(got) != len(tt.want) {
 
@@ -2746,11 +2738,10 @@ func TestSplitRow(t *testing.T) {
 // }
 
 func TestSplit(t *testing.T) {
-	p := NewParameters()
+	p := newParams()
 	p.Characters.SetDelimiter(characters.Character_PIPE)
 	p.Characters.SetEnclosure(characters.Character_QUOTATION_MARK)
-	r := NewRuntime(p, bufio.ScanLines)
-	r.Buffers = NewBuffers()
+	r := newSplitter(p)
 	tests := []TestData{
 		{
 			name: "zero",
@@ -2788,7 +2779,7 @@ func TestSplit(t *testing.T) {
 	}
 }
 
-func TestParseRow(t *testing.T) {
+func TestSplitRowCounted(t *testing.T) {
 
 	// p.Delimiter = characters.Character_PIPE
 	// p.Enclosure = characters.Character_QUOTATION_MARK
@@ -2797,35 +2788,28 @@ func TestParseRow(t *testing.T) {
 
 	for _, tt := range tests {
 		if tt.php {
-			t.Logf("ParseRow() %s requires cleanup for PHP", tt.name)
+			t.Logf("SplitRow() %s requires cleanup for PHP", tt.name)
 			continue
 		}
 		t.Run(tt.name, func(t *testing.T) {
 			debug.DebugLog = tt.debug
-			p := NewParameters()
+			p := newParams()
 			p.Characters.SetDelimiter(tt.delimiter)
 			p.Characters.SetEnclosure(tt.enclosure)
 			p.Exclude = tt.exclude
-			r := NewRuntime(p, bufio.ScanLines)
-			r.Buffers = NewBuffers()
-			// fake this
-			r.headerPrinted = true
-
+			r := newSplitter(p)
 			if tt.colcount != 0 {
 				r.colCount = tt.colcount
 			} else {
 				r.colCount = len(tt.want)
 			}
 
-			// SplitRow expects a count+outsideCount appended to the data set, must be 32bit encoded
-			data := append(tt.args.data, util.EncodeCounts(make([]byte, 8), 0, tt.delimCount)...)
-
-			if got := util.FlatToMulti(r.ParseRow(data)); !cmp.Equal(got, tt.want) {
+			if got := util.FlatToMulti(r.SplitRow(0, tt.args.data, 0, int(tt.delimCount), false)); !cmp.Equal(got, tt.want) {
 				if diff := cmp.Diff(tt.want, got); diff != "" {
 					for i := range got {
 						if i < len(tt.want) {
 							if textdiff := cmp.Diff(string(tt.want[i]), string(got[i])); textdiff != "" {
-								t.Errorf("ParseRow() %s: Mismatch (byte slice %d) (-want +got):\n%s", tt.name, i, textdiff)
+								t.Errorf("SplitRow() %s: Mismatch (byte slice %d) (-want +got):\n%s", tt.name, i, textdiff)
 							}
 						}
 					}
@@ -2836,114 +2820,14 @@ func TestParseRow(t *testing.T) {
 	}
 }
 
-func TestRuntime(t *testing.T) {
-
-	tests := []struct {
-		name    string
-		start   int
-		skip    int
-		rowid   bool
-		nd      bool
-		exclude []int
-	}{
-		{
-			name: "full",
-		},
-		{
-			name: "skip",
-			skip: 1,
-		},
-		{
-			name:  "start",
-			start: 2,
-		},
-		{
-			name:  "rowid",
-			rowid: true,
-		},
-		{
-			name: "nd",
-			nd:   true,
-		},
-		{
-			name:    "exclude",
-			exclude: []int{2},
-		},
-	}
-
-	for _, tt := range tests {
-		debug.DebugLog = false
-		p := NewParameters()
-		p.Start = tt.start
-		p.Skip = tt.skip
-		p.Drop = true
-		p.RowID = tt.rowid
-		p.NewlineDelimited = true
-		p.Exclude = tt.exclude
-		var r *Runtime
-		if !tt.nd {
-			r = NewRuntime(p, p.Characters.SplitCsvInput)
-		} else {
-			r = NewRuntime(p, bufio.ScanLines)
-		}
-
-		f, err := os.OpenFile("../../../tests/head.csv", os.O_RDONLY, 0644)
-		if err != nil {
-			t.Errorf("Cannot open file: %s", err)
-		}
-
-		defer f.Close()
-
-		r.Init(f, NewBuffers())
-
-		pv := &progressbar.ProgressBar{}
-
-		var readWg sync.WaitGroup
-		var writeWg sync.WaitGroup
-		readWg.Add(1)
-		go r.Parse(&readWg, 5, pv)
-
-		if <-r.HeaderSet {
-			pr := NewParser(p, 1)
-			pr.Init(nil, NewBuffers())
-			pr.ProcessHeader(r.Header)
-
-			writeWg.Add(1)
-
-			go func(chunks <-chan [][]byte, routine *Runtime, w *sync.WaitGroup) {
-				defer w.Done()
-				for {
-					chunk, more := <-chunks
-
-					for i := range chunk {
-						routine.ProcessRow(routine.ParseRow(chunk[i]))
-					}
-
-					if !more {
-						log.Printf("no moar")
-						break
-					}
-				}
-
-				routine.Close()
-
-				return
-			}(r.Data, pr, &writeWg)
-		}
-
-		readWg.Wait()
-		writeWg.Wait()
-	}
-}
-
 var resultGenSplitBuf []byte
 var resultGenSplitPos []uint32
 
 func Benchmark_GenSplit(b *testing.B) {
 	var v []byte
 	in := []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI","2022-03-11T21:46:09N","9999-12-31T00:00:00N","9.89","9.89","","[{""exftqvytk_id"":""I007CCK"",""xfa_mswb"":""2021-08-15"",""gtctd"":""01"",""zpjlv"":""R"",""eamrd"":""35"",""xzdjwnv"":""1"",""bwjeamwtgug_mswb"":""2022-08-14""}]"`)
-	p := NewParameters()
-	r := NewRuntime(p, bufio.ScanLines)
+	p := newParams()
+	r := newSplitter(p)
 	buf := make([]byte, 0, 4*1024*1024)
 	pos := make([]uint32, 0, 1024)
 	b.ResetTimer()
@@ -2960,8 +2844,8 @@ func Benchmark_GenSplit(b *testing.B) {
 func Benchmark_GenSplitClean(b *testing.B) {
 	var v []byte
 	in := []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI","2022-03-11T21:46:09N","9999-12-31T00:00:00N","9.89","9.89","","[{""exftqvytk_id"":""I007CCK"",""xfa_mswb"":""2021-08-15"",""gtctd"":""01"",""zpjlv"":""R"",""eamrd"":""35"",""xzdjwnv"":""1"",""bwjeamwtgug_mswb"":""2022-08-14""}]"`)
-	p := NewParameters()
-	r := NewRuntime(p, bufio.ScanLines)
+	p := newParams()
+	r := newSplitter(p)
 	buf := make([]byte, 0, 4*1024*1024)
 	pos := make([]uint32, 0, 1024)
 	b.ResetTimer()
@@ -2979,16 +2863,14 @@ func Benchmark_SplitRow(b *testing.B) {
 	var v []byte
 	var pos []uint32
 	in := []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI","2022-03-11T21:46:09N","9999-12-31T00:00:00N","9.89","9.89",""`)
-	p := NewParameters()
+	p := newParams()
 	p.Characters.SetDelimiter(characters.Character_COMMA)
 	p.Characters.SetEnclosure(characters.Character_QUOTATION_MARK)
-	r := NewRuntime(p, bufio.ScanLines)
-	r.Buffers = NewBuffers()
+	r := newSplitter(p)
 	r.colCount = 10
-	data := append(in, util.EncodeCounts(make([]byte, 8), 9, 0)...)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		v, pos = r.SplitRow(0, data, false)
+		v, pos = r.SplitRow(0, in, 9, 0, false)
 	}
 
 	resultGenSplitBuf = v
@@ -2998,8 +2880,8 @@ func Benchmark_SplitRow(b *testing.B) {
 func Benchmark_GenSplitCharacterClean(b *testing.B) {
 	var v []byte
 	in := []byte(`"2189","97998848","007-04-8133","FCFO","DC_FZXMI","2022-03-11T21:46:09N","9999-12-31T00:00:00N","9.89","9.89","","[{""exftqvytk_id"":""I007CCK"",""xfa_mswb"":""2021-08-15"",""gtctd"":""01"",""zpjlv"":""R"",""eamrd"":""35"",""xzdjwnv"":""1"",""bwjeamwtgug_mswb"":""2022-08-14""}]"`)
-	p := NewParameters()
-	r := NewRuntime(p, bufio.ScanLines)
+	p := newParams()
+	r := newSplitter(p)
 	buf := make([]byte, 0, 4*1024*1024)
 	pos := make([]uint32, 0, 1024)
 	b.ResetTimer()
