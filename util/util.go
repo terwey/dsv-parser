@@ -110,9 +110,11 @@ type CharacterConfig struct {
 
 	// searched is the length of the input, from the start of the data
 	// SplitCsvInput was last given, whose lines were searched for an enclosure
-	// and hold none. It ends after a line break. searchedEOL and
-	// searchedDelimiter are the line break and delimiter of that search.
+	// and hold none. It ends after a line break and holds searchedLines lines.
+	// searchedEOL and searchedDelimiter are the line break and delimiter of
+	// that search.
 	searched          int
+	searchedLines     int
 	searchedEOL       characters.Character
 	searchedDelimiter characters.Character
 }
@@ -326,10 +328,11 @@ func (c *CharacterConfig) moveSearched(in []byte, advance int) {
 
 	eol := c.searchedEOL
 	if advance > c.searched || len(eol) == 0 || advance < len(eol) || !bytes.Equal(in[advance-len(eol):advance], eol) {
-		c.searched = 0
+		c.searched, c.searchedLines = 0, 0
 		return
 	}
 	c.searched -= advance
+	c.searchedLines -= bytes.Count(in[:advance], eol)
 }
 
 func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -472,7 +475,7 @@ findEolIndex:
 			if replaced := c.ReplaceBackslashEscapedEnclosure(in[:eolIndex]); len(replaced) == eolIndex {
 				copy(in, replaced)
 				// the lines searched for an enclosure are not the lines in the data anymore
-				c.searched = 0
+				c.searched, c.searchedLines = 0, 0
 			}
 		}
 
@@ -751,7 +754,7 @@ func (c *CharacterConfig) endsField(after []byte) bool {
 }
 
 func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
-	cc.searched = 0
+	cc.searched, cc.searchedLines = 0, 0
 	cc.detectDelimiterAndEnclosureInChunk(in, eolIndex)
 }
 
@@ -764,7 +767,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 	}
 
 	if !bytes.Equal(cc.searchedEOL, cc.EOL) || !bytes.Equal(cc.searchedDelimiter, cc.Delimiter) {
-		cc.searched = 0
+		cc.searched, cc.searchedLines = 0, 0
 		cc.searchedEOL = cc.EOL
 		cc.searchedDelimiter = cc.Delimiter
 	}
@@ -795,6 +798,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			}
 			if complete && tmpStart == cc.searched {
 				cc.searched = tmpEolIndex + len(cc.EOL)
+				cc.searchedLines = i + 1
 			}
 		}
 		// maybe the header contains a newline inside an enclosure
@@ -810,6 +814,14 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 		}
 		if len(in) > tmpEolIndex+len(cc.EOL) {
 			tmpStart = tmpEolIndex + len(cc.EOL)
+			// the lines up to searched are skipped one by one otherwise
+			if i >= 1 && cc.searchedLines > i+1 && cc.searched > tmpStart && cc.searched <= len(in) {
+				tmpStart = cc.searched
+				i = cc.searchedLines - 1
+				if tmpStart == len(in) {
+					break
+				}
+			}
 			// debug.Debug("searching inside: %s", in[tmpStart:])
 			tmpEolIndex = bytes.Index(in[tmpStart:], cc.EOL)
 			// we could be at the end of a file
