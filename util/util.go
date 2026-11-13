@@ -289,28 +289,23 @@ func CountOutsideEnclosure(s []byte, sep, enclosure characters.Character) int {
 
 func FindEOLCharacter(in []byte) characters.Character {
 	// there is a chance that the header is LF and the rest of the file is CRLF
-	// the only way to catch that is by checking if the LF is nearby the CR, so we take the position
-	// of both. If the index is only off by 1 we know the character is a CRLF and else it's just LF (or CR).
-	lfIndex := bytes.Index(in, characters.Character_LINE_FEED)
-	crIndex := bytes.Index(in, characters.Character_CARRIAGE_RETURN)
+	// the first line break decides: a CR followed by a LF is CRLF, a CR alone is CR, a LF is LF.
+	// Only in up to that line break is looked at, the rest of it can be megabytes.
+	first := bytes.IndexAny(in, "\r\n")
+	if first == -1 {
+		return characters.Character_EMPTY
+	}
 
-	if lfIndex != 0 && crIndex == lfIndex-1 {
+	if in[first] == characters.Character_LINE_FEED[0] {
+		return characters.Character_LINE_FEED
+	}
+
+	if first+1 < len(in) && in[first+1] == characters.Character_LINE_FEED[0] {
 		// the character is CRLF
 		return characters.Character_CARRIAGE_RETURN_LINE_FEED
 	}
 
-	if lfIndex != -1 && lfIndex < crIndex {
-		return characters.Character_LINE_FEED
-	}
-
-	if crIndex != -1 {
-		return characters.Character_CARRIAGE_RETURN
-	}
-	if lfIndex != -1 {
-		return characters.Character_LINE_FEED
-	}
-
-	return characters.Character_EMPTY
+	return characters.Character_CARRIAGE_RETURN
 }
 
 // SplitCsvInput is a bufio.SplitFunc that returns one record per token. Every
