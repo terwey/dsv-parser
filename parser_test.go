@@ -2,14 +2,16 @@ package dsv
 
 import (
 	"bytes"
+	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/exp/slices"
+
 	"github.com/terwey/dsv-parser/characters"
 	"github.com/terwey/dsv-parser/internal/debug"
 	"github.com/terwey/dsv-parser/util"
-	"golang.org/x/exp/slices"
-	"math/rand"
 )
 
 func Benchmark_SplitUnescapedDelimiter(b *testing.B) {
@@ -2905,25 +2907,42 @@ func Test_splitter_splitWholeRow(t *testing.T) {
 
 	type config struct {
 		name      string
+		delimiter characters.Character
 		enclosure characters.Character
 		excel     bool
 	}
 	configs := []config{
-		{name: "enclosure", enclosure: characters.Character_QUOTATION_MARK},
-		{name: "no enclosure"},
-		{name: "enclosure, Excel", enclosure: characters.Character_QUOTATION_MARK, excel: true},
+		{name: "enclosure", delimiter: characters.Character_COMMA, enclosure: characters.Character_QUOTATION_MARK},
+		{name: "no enclosure", delimiter: characters.Character_COMMA},
+		{name: "enclosure, Excel", delimiter: characters.Character_COMMA, enclosure: characters.Character_QUOTATION_MARK, excel: true},
+		{name: "semicolon and apostrophe", delimiter: characters.Character_SEMICOLON, enclosure: characters.Character_APOSTROPHE},
 	}
 
 	for _, cfg := range configs {
 		t.Run(cfg.name, func(t *testing.T) {
 			newTestSplitter := func() *splitter {
 				p := newParams()
-				p.Characters.SetDelimiter(characters.Character_COMMA)
+				p.Characters.SetDelimiter(cfg.delimiter)
 				p.Characters.SetEnclosure(cfg.enclosure)
 				p.Characters.Excel = cfg.excel
 				return newSplitter(p)
 			}
 			got, want := newTestSplitter(), newTestSplitter()
+
+			// the fields are written for a comma and a quotation mark
+			replacer := strings.NewReplacer(",", string(cfg.delimiter), `"`, string(cfg.enclosure))
+			if len(cfg.enclosure) == 0 {
+				replacer = strings.NewReplacer(",", string(cfg.delimiter))
+			}
+			fields := func(list []string) []string {
+				replaced := make([]string, len(list))
+				for i := range list {
+					replaced[i] = replacer.Replace(list[i])
+				}
+				return replaced
+			}
+			plain, whole, broken := fields(plain), fields(whole), fields(broken)
+			delimiter := cfg.delimiter[0]
 
 			rng := rand.New(rand.NewSource(1))
 			split := 0
@@ -2932,7 +2951,7 @@ func Test_splitter_splitWholeRow(t *testing.T) {
 				columns := 1 + rng.Intn(7)
 				for column := 0; column < columns; column++ {
 					if column != 0 {
-						row = append(row, ',')
+						row = append(row, delimiter)
 					}
 					switch n := rng.Intn(40); {
 					case n == 0:
@@ -2954,14 +2973,14 @@ func Test_splitter_splitWholeRow(t *testing.T) {
 				// the counts the cutter hands over, or none
 				count, outside := 0, 0
 				if rng.Intn(2) == 0 {
-					count = bytes.Count(row, characters.Character_COMMA)
+					count = bytes.Count(row, cfg.delimiter)
 					if rng.Intn(2) == 0 {
-						outside = util.CountOutsideEnclosure(row, characters.Character_COMMA, cfg.enclosure)
+						outside = util.CountOutsideEnclosure(row, cfg.delimiter, cfg.enclosure)
 					}
 				}
 				data := row
 				if cfg.excel {
-					row = append(row, ',')
+					row = append(row, delimiter)
 					if count != 0 || outside != 0 {
 						count++
 						outside++
@@ -2975,11 +2994,14 @@ func Test_splitter_splitWholeRow(t *testing.T) {
 				}
 				split++
 
-				want.inside, want.hasPrefixEnclosure, want.hasSuffixEnclosure = false, false, false
 				wantOut, wantPos := want.splitRow(0, data, count, outside, false)
 				if !bytes.Equal(gotOut, wantOut) || !slices.Equal(gotPos, wantPos) {
 					t.Fatalf("splitWholeRow(%q, %d columns, counts %d and %d)\n got %q %v\nwant %q %v",
 						data, colCount, count, outside, gotOut, gotPos, wantOut, wantPos)
+				}
+				// splitRow split it with a splitter that keeps no state and counts nothing
+				if want.inside || want.RowCounter != (RowCount{}) {
+					t.Fatalf("splitRow(%q) left inside = %v and RowCounter = %+v", data, want.inside, want.RowCounter)
 				}
 			}
 			if split < 50000 {

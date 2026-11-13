@@ -158,11 +158,17 @@ func Test_startsPlain(t *testing.T) {
 
 	// what startsPlain lets through, the search finds nothing in
 	t.Run("generated", func(t *testing.T) {
-		alphabet := []byte("ab1 \t\n\r\"\"'*?-.{,,,;|\xc3\xa9")
+		// runs of one letter or digit make the search take two and three bytes as the candidate
+		alphabets := []string{
+			"ab1 \t\n\r\"\"'*?-.{,,,;|\xc3\xa9",
+			"aaAA1100??  \v\f,,\"'",
+			"aZ09 ,,,?\"\"\"'*",
+		}
 		rng := rand.New(rand.NewSource(1))
 		plain := 0
 		for i := 0; i < 400000; i++ {
-			data := make([]byte, 1+rng.Intn(24))
+			alphabet := alphabets[i%len(alphabets)]
+			data := make([]byte, 1+rng.Intn(48))
 			for j := range data {
 				data[j] = alphabet[rng.Intn(len(alphabet))]
 			}
