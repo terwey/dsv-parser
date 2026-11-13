@@ -16,7 +16,6 @@ func countBytes(data []byte, delimiter, enclosure byte) Counts {
 		case enclosure:
 			c.Enclosures++
 		case delimiter:
-			c.Delimiters++
 			if c.Enclosures%2 == 0 {
 				c.Outside++
 			}
@@ -31,11 +30,11 @@ func TestCounts_Add(t *testing.T) {
 		data string
 		want Counts
 	}{
-		{name: "delimiter inside an enclosure", data: `"a,b",c`, want: Counts{Delimiters: 2, Enclosures: 2, Outside: 1}},
-		{name: "enclosure left open", data: `a,"b,c,d`, want: Counts{Delimiters: 3, Enclosures: 1, Outside: 1}},
-		{name: "enclosure open across eight bytes", data: `aaaaaaa"bbbbbbbb,cccccccc,"d,e`, want: Counts{Delimiters: 3, Enclosures: 2, Outside: 1}},
-		{name: "doubled enclosure", data: `"a ""b"", c",d`, want: Counts{Delimiters: 2, Enclosures: 6, Outside: 1}},
-		{name: "no enclosure", data: `a,b,c,d,e,f,g,h,i,j`, want: Counts{Delimiters: 9, Outside: 9}},
+		{name: "delimiter inside an enclosure", data: `"a,b",c`, want: Counts{Enclosures: 2, Outside: 1}},
+		{name: "enclosure left open", data: `a,"b,c,d`, want: Counts{Enclosures: 1, Outside: 1}},
+		{name: "enclosure open across eight bytes", data: `aaaaaaa"bbbbbbbb,cccccccc,"d,e`, want: Counts{Enclosures: 2, Outside: 1}},
+		{name: "doubled enclosure", data: `"a ""b"", c",d`, want: Counts{Enclosures: 6, Outside: 1}},
+		{name: "no enclosure", data: `a,b,c,d,e,f,g,h,i,j`, want: Counts{Outside: 9}},
 		{name: "empty", data: ``, want: Counts{}},
 	}
 	for _, tt := range tests {
@@ -133,7 +132,7 @@ func BenchmarkCounts_Add(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var c Counts
 		c.Add(data, ',', '"')
-		if c.Delimiters == 0 {
+		if c.Outside == 0 {
 			b.Fatal("no delimiter counted")
 		}
 	}

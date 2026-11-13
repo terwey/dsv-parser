@@ -12,26 +12,7 @@ import (
 const (
 	ones = 0x0101010101010101
 	low7 = 0x7f7f7f7f7f7f7f7f
-
-	// gather moves the lowest bit of every byte of a word into its top byte
-	gather = 0x0102040810204080
 )
-
-// before[b] has bit i set when b has an odd number of bits set below bit i.
-var before = func() (table [256]uint8) {
-	for b := range table {
-		odd := false
-		for i := 0; i < 8; i++ {
-			if odd {
-				table[b] |= 1 << i
-			}
-			if b&(1<<i) != 0 {
-				odd = !odd
-			}
-		}
-	}
-	return table
-}()
 
 // Repeat returns a word that holds c in every byte.
 func Repeat(c byte) uint64 {
@@ -59,11 +40,9 @@ func Word(data []byte) uint64 {
 	return word
 }
 
-// Counts are the delimiters and enclosures of a record, counted up to some
-// position in it.
+// Counts are the enclosures of a record and its delimiters outside an
+// enclosure, counted up to some position in it.
 type Counts struct {
-	// Delimiters counts every delimiter.
-	Delimiters int
 	// Enclosures counts every enclosure.
 	Enclosures int
 	// Outside counts the delimiters with an even number of enclosures before them.
@@ -73,53 +52,42 @@ type Counts struct {
 // Add counts data, which follows what c has counted so far, into c.
 func (c *Counts) Add(data []byte, delimiter, enclosure byte) {
 	repeatedDelimiter, repeatedEnclosure := Repeat(delimiter), Repeat(enclosure)
-	delimiterCount, enclosureCount, outsideCount := c.Delimiters, c.Enclosures, c.Outside
-	inside := enclosureCount&1 != 0
+	enclosureCount, outsideCount := c.Enclosures, c.Outside
+	// open holds 1 in every byte while an enclosure is open
+	var open uint64
+	if enclosureCount&1 != 0 {
+		open = ones
+	}
 
 	for len(data) >= 8 {
 		word := binary.LittleEndian.Uint64(data)
 		data = data[8:]
 
-		delimiters := Equal(word, repeatedDelimiter)
-		enclosures := Equal(word, repeatedEnclosure)
+		delimiters := Equal(word, repeatedDelimiter) >> 7
+		// byte i of before holds the number of enclosures in bytes 0 to i of word
+		before := Equal(word, repeatedEnclosure) >> 7 * ones
 
-		if enclosures == 0 {
-			n := bits.OnesCount64(delimiters)
-			delimiterCount += n
-			if !inside {
-				outsideCount += n
-			}
-			continue
-		}
+		outsideCount += bits.OnesCount64(delimiters &^ (before ^ open))
 
-		enclosed := before[uint8((enclosures>>7)*gather>>56)]
-		if inside {
-			enclosed = ^enclosed
-		}
-		outsideCount += bits.OnesCount8(uint8((delimiters>>7)*gather>>56) &^ enclosed)
-		delimiterCount += bits.OnesCount64(delimiters)
-
-		n := bits.OnesCount64(enclosures)
-		enclosureCount += n
-		if n&1 != 0 {
-			inside = !inside
-		}
+		n := before >> 56
+		enclosureCount += int(n)
+		open ^= ones * (n & 1)
 	}
 
+	inside := open != 0
 	for _, b := range data {
 		switch b {
 		case enclosure:
 			enclosureCount++
 			inside = !inside
 		case delimiter:
-			delimiterCount++
 			if !inside {
 				outsideCount++
 			}
 		}
 	}
 
-	c.Delimiters, c.Enclosures, c.Outside = delimiterCount, enclosureCount, outsideCount
+	c.Enclosures, c.Outside = enclosureCount, outsideCount
 }
 
 // notPlainStart is 0 for a letter, a digit and white space, and 1 for every other byte.
