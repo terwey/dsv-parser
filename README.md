@@ -222,33 +222,6 @@ The options are what the caller tells the `Reader` about the rows:
 parser looks for one in every record, because a quote can first show up at row 200. A file without any pays for that
 search on every record. Each of the other three cases switches the search off.
 
-On an Apple M2 Max:
-
-```
-goos: darwin
-goarch: arm64
-pkg: github.com/terwey/dsv-parser
-cpu: Apple M2 Max
-BenchmarkReader_Run/Enclosed/AutoDetect/20_columns-12                               909  1321492 ns/op    793.60 MB/s  141426 B/op 0 allocs/op
-BenchmarkReader_Run/Enclosed/AutoDetect/200_columns-12                             1015  1150536 ns/op    913.30 MB/s  159317 B/op 0 allocs/op
-BenchmarkReader_Run/Enclosed/DelimiterAndEnclosureSet/20_columns-12                 890  1311495 ns/op    799.65 MB/s  144512 B/op 0 allocs/op
-BenchmarkReader_Run/Enclosed/DelimiterAndEnclosureSet/200_columns-12               1045  1147644 ns/op    915.60 MB/s  106558 B/op 0 allocs/op
-BenchmarkReader_Run/EnclosedOneLine/AutoDetect/20_columns-12                       2102   558555 ns/op   1877.67 MB/s  117352 B/op 0 allocs/op
-BenchmarkReader_Run/EnclosedOneLine/AutoDetect/200_columns-12                      3036   364370 ns/op   2884.54 MB/s   75416 B/op 0 allocs/op
-BenchmarkReader_Run/EnclosedOneLine/DelimiterAndEnclosureSet/20_columns-12         2032   548710 ns/op   1911.35 MB/s   96535 B/op 0 allocs/op
-BenchmarkReader_Run/EnclosedOneLine/DelimiterAndEnclosureSet/200_columns-12        3093   362549 ns/op   2899.03 MB/s   74029 B/op 0 allocs/op
-BenchmarkReader_Run/EnclosedOneLine/EnclosureSetNewlineDelimited/20_columns-12     6628   151227 ns/op   6935.12 MB/s   75908 B/op 0 allocs/op
-BenchmarkReader_Run/EnclosedOneLine/EnclosureSetNewlineDelimited/200_columns-12    7273   139297 ns/op   7545.30 MB/s   50036 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/AutoDetect/20_columns-12                           1432   816371 ns/op   1284.58 MB/s  101879 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/AutoDetect/200_columns-12                          2292   486995 ns/op   2153.60 MB/s   77891 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/EnclosureSet/20_columns-12                         3380   343093 ns/op   3056.58 MB/s   63442 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/EnclosureSet/200_columns-12                       10344   114004 ns/op   9199.60 MB/s   41636 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/NoEnclosureSet/20_columns-12                       9004   125828 ns/op   8334.34 MB/s   48455 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/NoEnclosureSet/200_columns-12                     12948    92691 ns/op  11314.96 MB/s   30684 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/NewlineDelimited/20_columns-12                     9282   137065 ns/op   7651.06 MB/s   59705 B/op 0 allocs/op
-BenchmarkReader_Run/NoEnclosure/NewlineDelimited/200_columns-12                   13082    90790 ns/op  11551.92 MB/s   44485 B/op 0 allocs/op
-```
-
 ### On one CPU
 
 ```sh
@@ -271,6 +244,43 @@ named `Rows/Options/columns` too:
 |---|---|
 | `Default` | Nothing. Every record is allocated, as with `ReadStrings`. |
 | `ReuseRecord` | `ReuseRecord`. A record is valid until the next `Read`, as with `Read`. |
+
+### Results
+
+On an Apple M2 Max with 12 cores, the median of five runs. A cell holds the value at 20 and at 200 columns.
+
+One CPU, in MB/s: `BenchmarkBuiltin_Read` and `BenchmarkReader_ReadOneCPU`.
+
+| Rows | `encoding/csv`, `Default` | `encoding/csv`, `ReuseRecord` | `dsv`, `AutoDetect` | `dsv`, delimiter and enclosure set |
+|---|---|---|---|---|
+| `Enclosed` | 528 / 576 | 589 / 612 | 797 / 815 | 794 / 814 |
+| `EnclosedOneLine` | 539 / 571 | 591 / 609 | 819 / 820 | 814 / 819 |
+| `NoEnclosure` | 578 / 638 | 673 / 704 | 1252 / 1298 | 1238 / 1298 |
+
+The same runs, in allocations and bytes allocated per mebibyte of input:
+
+| Rows | `encoding/csv`, `Default` | `encoding/csv`, `ReuseRecord` | `dsv`, `AutoDetect` |
+|---|---|---|---|
+| `Enclosed` | 7074 / 718, 2.0 MB / 2.1 MB | 3537 / 359, 0.8 MB / 0.8 MB | 0 / 0, 0.2 MB / 0.1 MB |
+| `EnclosedOneLine` | 7170 / 728, 2.0 MB / 2.1 MB | 3585 / 364, 0.8 MB / 0.8 MB | 0 / 1, 0.1 MB / 0.1 MB |
+| `NoEnclosure` | 9142 / 930, 2.5 MB / 2.6 MB | 4571 / 465, 1.0 MB / 1.0 MB | 0 / 0, 0.1 MB / 0.1 MB |
+
+All cores, in MB/s: `BenchmarkReader_Run`. No case allocates more than 0.2 MB per mebibyte of input.
+
+| Rows | Options | MB/s |
+|---|---|---|
+| `Enclosed` | `AutoDetect` | 791 / 906 |
+| `Enclosed` | `DelimiterAndEnclosureSet` | 789 / 906 |
+| `EnclosedOneLine` | `AutoDetect` | 1896 / 2884 |
+| `EnclosedOneLine` | `DelimiterAndEnclosureSet` | 1924 / 2902 |
+| `EnclosedOneLine` | `EnclosureSetNewlineDelimited` | 6896 / 7629 |
+| `NoEnclosure` | `AutoDetect` | 1303 / 2211 |
+| `NoEnclosure` | `EnclosureSet` | 3099 / 9238 |
+| `NoEnclosure` | `NoEnclosureSet` | 8177 / 11343 |
+| `NoEnclosure` | `NewlineDelimited` | 8124 / 11419 |
+
+`Enclosed` is as fast on one CPU as on all of them: the goroutine that cuts the input into records is the limit
+when fields hold line breaks.
 
 ## Tests
 
