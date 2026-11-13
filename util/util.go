@@ -107,6 +107,14 @@ type CharacterConfig struct {
 
 	// prevents re-detection of the EOL
 	FixedEOL bool
+
+	// searched is the length of the input, from the start of the data
+	// SplitCsvInput was last given, whose lines were searched for an enclosure
+	// and hold none. It ends after a line break. searchedEOL and
+	// searchedDelimiter are the line break and delimiter of that search.
+	searched          int
+	searchedEOL       characters.Character
+	searchedDelimiter characters.Character
 }
 
 func NewCharacterConfig(delimiter, enclosure characters.Character) *CharacterConfig {
@@ -305,7 +313,31 @@ func FindEOLCharacter(in []byte) characters.Character {
 	return characters.Character_EMPTY
 }
 
+// SplitCsvInput is a bufio.SplitFunc that returns one record per token. Every
+// call must be given the data that follows what the previous call advanced over.
 func (c *CharacterConfig) SplitCsvInput(in []byte, atEOF bool) (advance int, token []byte, err error) {
+	advance, token, err = c.splitCsvInput(in, atEOF)
+	c.moveSearched(in, advance)
+	return advance, token, err
+}
+
+// moveSearched keeps searched at the same place of the input once the caller
+// has advanced. An advance that does not end on a line break of the search
+// leaves no line the search can be trusted for.
+func (c *CharacterConfig) moveSearched(in []byte, advance int) {
+	if advance == 0 {
+		return
+	}
+
+	eol := c.searchedEOL
+	if advance > c.searched || len(eol) == 0 || advance < len(eol) || !bytes.Equal(in[advance-len(eol):advance], eol) {
+		c.searched = 0
+		return
+	}
+	c.searched -= advance
+}
+
+func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, token []byte, err error) {
 	if len(in) == 0 && atEOF {
 		return 0, nil, io.EOF
 	}
@@ -352,7 +384,7 @@ findEolIndex:
 
 	if len(c.Enclosure) == 0 && !c.EnclosureIsEmpty {
 		// debug.Debug("c.Enclosure: +%s+ c.EnclosureIsEmpty: %t", c.Enclosure, c.EnclosureIsEmpty)
-		c.DetectDelimiterAndEnclosureInChunk(in, eolIndex)
+		c.detectDelimiterAndEnclosureInChunk(in, eolIndex)
 	}
 
 	if c.ReturnEarly {
@@ -444,6 +476,8 @@ findEolIndex:
 		if c.PHP && bytes.Contains(in[:eolIndex], c.EscapedEnclosure) {
 			if replaced := c.ReplaceBackslashEscapedEnclosure(in[:eolIndex]); len(replaced) == eolIndex {
 				copy(in, replaced)
+				// the lines searched for an enclosure are not the lines in the data anymore
+				c.searched = 0
 			}
 		}
 
@@ -722,12 +756,28 @@ func (c *CharacterConfig) endsField(after []byte) bool {
 }
 
 func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
+	cc.searched = 0
+	cc.detectDelimiterAndEnclosureInChunk(in, eolIndex)
+}
+
+// detectDelimiterAndEnclosureInChunk searches the line ending at eolIndex and
+// up to 49 lines after it for an enclosure. A line a call before it searched,
+// counted by searched, is not searched again.
+func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
 	if len(cc.Delimiter) == 0 {
 		cc.SetDelimiter(characters.DetectDelimiter(in[:eolIndex]))
 	}
 
+	if !bytes.Equal(cc.searchedEOL, cc.EOL) || !bytes.Equal(cc.searchedDelimiter, cc.Delimiter) {
+		cc.searched = 0
+		cc.searchedEOL = cc.EOL
+		cc.searchedDelimiter = cc.Delimiter
+	}
+
 	tmpEolIndex := eolIndex
 	var tmpStart int
+	// complete is false for the last line of in when its line break is not in yet
+	complete := true
 	tries := 50
 	i := 0
 	for {
@@ -737,15 +787,20 @@ func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolInde
 		if len(in) < tmpEolIndex {
 			break
 		}
-		// debug.Debug("passing data: %s", in[tmpStart:tmpEolIndex])
-		encl, enclDetectCount, occurence := characters.DetectEnclosureWithDelimiter(in[tmpStart:tmpEolIndex], cc.Delimiter)
-		if enclDetectCount > 0 {
-			cc.SetEnclosure(encl)
-			if debug.DebugLog {
-				debug.Debug("enclosure (%s) count: %d occurence: %d found in: \n+%s+", encl, enclDetectCount, occurence, in[tmpStart:tmpEolIndex])
-				// panic("yo")
+		if tmpEolIndex+len(cc.EOL) > cc.searched {
+			// debug.Debug("passing data: %s", in[tmpStart:tmpEolIndex])
+			encl, enclDetectCount, occurence := characters.DetectEnclosureWithDelimiter(in[tmpStart:tmpEolIndex], cc.Delimiter)
+			if enclDetectCount > 0 {
+				cc.SetEnclosure(encl)
+				if debug.DebugLog {
+					debug.Debug("enclosure (%s) count: %d occurence: %d found in: \n+%s+", encl, enclDetectCount, occurence, in[tmpStart:tmpEolIndex])
+					// panic("yo")
+				}
+				break
 			}
-			break
+			if complete && tmpStart == cc.searched {
+				cc.searched = tmpEolIndex + len(cc.EOL)
+			}
 		}
 		// maybe the header contains a newline inside an enclosure
 		if i == 1 {
@@ -765,6 +820,7 @@ func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			// we could be at the end of a file
 			if tmpEolIndex == -1 {
 				tmpEolIndex = len(in)
+				complete = false
 				i++
 				continue
 			}
