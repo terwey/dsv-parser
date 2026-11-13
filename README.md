@@ -142,6 +142,10 @@ err = r.Run(func() (dsv.Handler, error) {
 | `WithPHP()` | Reads a backslash before an enclosure as an escape. | Switched on when the input calls for it |
 | `WithStart(line)` | The 1-based line the header is on. Lines before it are skipped; empty lines are not counted. | 1 |
 | `WithExclude(cols...)` | Drops the columns at these 0-based indices from every record. | None |
+| `WithSkip(n)` | Skips the first `n` records after the header. | 0 |
+| `WithLimit(n)` | Stops after `n` records; the rest of the input is not read. | No limit |
+| `WithLineEnding(b)` | Sets the line ending to start with: LF, CRLF or CR. | Detected |
+| `WithFixedLineEnding()` | Keeps the first line ending when the file changes its line ending. | Off |
 | `WithBufferSize(n)` | The largest record, in bytes. | 16 MiB |
 | `WithWorkers(n)` | The number of workers that split records. | One per CPU |
 | `WithOrder()` | Makes `Read` return records in input order. | Off |
@@ -154,6 +158,8 @@ err = r.Run(func() (dsv.Handler, error) {
   become LF.
 - **Empty rows.** A record without a value in any field is skipped. Its row number is not reused.
 - **Row width.** A record can hold fewer or more fields than the header. Padding or cutting it is up to you.
+- **Detected characters.** `Reader.Characters` returns the delimiter, enclosure and line ending the `Reader` ended
+  up with. Like the counters it is complete once `Run` has returned or `Read` has returned `io.EOF`.
 - **Counters.** `Reader.RowCounter` tells how many records went through the slower `encoding/csv` fallback and how
   many no splitter could split. It is complete once `Run` has returned or `Read` has returned `io.EOF`.
 

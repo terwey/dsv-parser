@@ -112,6 +112,53 @@ func TestReader_Read(t *testing.T) {
 			want:  [][]string{{"id", "name"}, {"1", "foo"}},
 		},
 		{
+			name:  "skips the first records after the header",
+			input: "a,b\n1,2\n3,4\n5,6\n7,8\n",
+			opts:  []Option{WithSkip(2)},
+			want:  [][]string{{"a", "b"}, {"5", "6"}, {"7", "8"}},
+		},
+		{
+			name:  "stops after the limit",
+			input: "a,b\n1,2\n3,4\n5,6\n7,8\n",
+			opts:  []Option{WithLimit(2)},
+			want:  [][]string{{"a", "b"}, {"1", "2"}, {"3", "4"}},
+		},
+		{
+			name:  "limit counts from the first record that is not skipped",
+			input: "a,b\n1,2\n3,4\n5,6\n7,8\n",
+			opts:  []Option{WithSkip(1), WithLimit(2)},
+			want:  [][]string{{"a", "b"}, {"3", "4"}, {"5", "6"}},
+		},
+		{
+			name:  "limit of zero returns the header alone",
+			input: "a,b\n1,2\n",
+			opts:  []Option{WithLimit(0)},
+			want:  [][]string{{"a", "b"}},
+		},
+		{
+			name:  "header ending with a delimiter is judged by the first record that is not skipped",
+			input: "a,b,\n1,2,\n3,4,\n5,6,x\n",
+			opts:  []Option{WithSkip(2)},
+			want:  [][]string{{"a", "b", "empty_column"}, {"5", "6", "x"}},
+		},
+		{
+			name:  "line ending set to CRLF reads a LF as data",
+			input: "a,b\n1,2\r\n3,4\r\n5,6\n",
+			opts:  []Option{WithLineEnding([]byte("\r\n"))},
+			want:  [][]string{{"a", "b 1", "2"}, {"3", "4"}, {"5", "6\n"}},
+		},
+		{
+			name:  "line ending follows the file",
+			input: "\"a\",\"b\"\r\n\"1\",\"x\r\ny\"\n\"3\",\"4\"\n\"5\",\"6\"\n",
+			want:  [][]string{{"a", "b"}, {"1", "x\ny"}, {"3", "4"}, {"5", "6"}},
+		},
+		{
+			name:  "fixed line ending does not follow the file",
+			input: "\"a\",\"b\"\r\n\"1\",\"x\r\ny\"\n\"3\",\"4\"\n\"5\",\"6\"\n",
+			opts:  []Option{WithFixedLineEnding()},
+			want:  [][]string{{"a", "b"}, {"1", "x\ny\"\n\"3", "4\"\n\"5", "\"6\"\n"}},
+		},
+		{
 			name:  "empty input",
 			input: "",
 			want:  nil,
@@ -125,6 +172,17 @@ func TestReader_Read(t *testing.T) {
 				t.Errorf("Read() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestReader_Characters(t *testing.T) {
+	r := NewReader(strings.NewReader("\"id\"|\"name\"\r\n\"1\"|\"Foo | Bar\"\r\n"))
+	readAll(t, r)
+
+	got := r.Characters()
+	want := []string{"|", `"`, "\r\n"}
+	if diff := cmp.Diff(want, []string{string(got.Delimiter), string(got.Enclosure), string(got.EOL)}); diff != "" {
+		t.Errorf("Characters() delimiter, enclosure and line ending mismatch (-want +got):\n%s", diff)
 	}
 }
 

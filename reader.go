@@ -66,6 +66,8 @@ type Reader struct {
 
 	workers int
 	ordered bool
+	skip    int
+	limit   int
 
 	// cutter state, touched by the cutter goroutine only
 	delimSet        bool
@@ -73,6 +75,9 @@ type Reader struct {
 	enclDetectCount int
 	startCounter    int
 	headerRead      bool
+	skipped         int
+	// limited is set when the cutter stopped at the limit
+	limited bool
 	// a header ending with a delimiter waits for the first row
 	pendingHeader []byte
 	blk           *block
@@ -202,6 +207,45 @@ func WithStart(line int) Option {
 	}
 }
 
+// WithSkip skips the first records after the header. A skipped record gets no
+// row number.
+func WithSkip(records int) Option {
+	return func(r *Reader) {
+		r.skip = records
+	}
+}
+
+// WithLimit stops the Reader after the given number of records, the header
+// and the skipped records not counted. The rest of the input is not read.
+func WithLimit(records int) Option {
+	return func(r *Reader) {
+		if records < 0 {
+			return
+		}
+		r.limit = records
+	}
+}
+
+// WithLineEnding sets the line ending the Reader starts with instead of
+// detecting it: LF, CRLF or CR. The Reader still follows a file that changes
+// its line ending, unless WithFixedLineEnding is set.
+func WithLineEnding(eol []byte) Option {
+	return func(r *Reader) {
+		if len(eol) == 0 {
+			return
+		}
+		r.p.Characters.EOL = append(characters.Character{}, eol...)
+	}
+}
+
+// WithFixedLineEnding keeps the line ending the Reader detected or was given:
+// a file that changes its line ending is read with the first one.
+func WithFixedLineEnding() Option {
+	return func(r *Reader) {
+		r.p.Characters.FixedEOL = true
+	}
+}
+
 // WithExclude drops the columns at the given 0-based indices from every record.
 func WithExclude(columns ...int) Option {
 	return func(r *Reader) {
@@ -243,6 +287,7 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 		p:            newParams(),
 		workers:      runtime.GOMAXPROCS(0),
 		startCounter: 1,
+		limit:        -1,
 		headerCh:     make(chan *header, 1),
 		quit:         make(chan struct{}),
 	}
@@ -310,6 +355,14 @@ func (r *Reader) Header() ([][]byte, error) {
 		return nil, io.EOF
 	}
 	return r.hdr.names, nil
+}
+
+// Characters returns the delimiter, enclosure and line ending the Reader was
+// given or detected, and the modes it switched on. Detection goes on while the
+// input is read: the result is complete once Run has returned or Read has
+// returned io.EOF, and is not to be called before that.
+func (r *Reader) Characters() util.CharacterConfig {
+	return *r.p.Characters
 }
 
 // Run splits the records after the header and hands each to a Handler. It
@@ -660,6 +713,9 @@ func (r *Reader) cut() {
 		}
 		if !r.record(token) {
 			return
+		}
+		if r.limited {
+			break
 		}
 	}
 
