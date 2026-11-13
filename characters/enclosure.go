@@ -9,7 +9,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/terwey/csv2sqlite/cmd/csv2sqlite/debug"
+	"github.com/terwey/dsv-parser/internal/debug"
 )
 
 func knownEnclosures() []Character {

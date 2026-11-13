@@ -3,7 +3,7 @@
 
 package knownconfigs
 
-import "github.com/terwey/csv2sqlite/characters"
+import "github.com/terwey/dsv-parser/characters"
 
 // CSV returns a config set for COMMA, QUOTATION_MARK and LF
 func CSV() characters.Config {
