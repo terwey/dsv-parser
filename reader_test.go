@@ -166,6 +166,51 @@ func TestReader_Close_beforeEOF(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Errorf("Close() = %v", err)
 	}
+	if _, err := r.Read(); !errors.Is(err, ErrClosed) {
+		t.Errorf("Read() after Close error = %v, want %v", err, ErrClosed)
+	}
+}
+
+func TestReader_Read_afterError(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		opts  []Option
+		want  error
+	}{
+		{
+			name:  "empty input",
+			input: "",
+			want:  io.EOF,
+		},
+		{
+			name:  "header longer than the buffer",
+			input: strings.Repeat("x", 1024) + "\n",
+			opts:  []Option{WithBufferSize(64)},
+			want:  bufio.ErrTooLong,
+		},
+		{
+			name:  "buffer size below 1",
+			input: "id,name\n1,foo\n",
+			opts:  []Option{WithBufferSize(-1)},
+			want:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewReader(strings.NewReader(tt.input), tt.opts...)
+			defer r.Close()
+
+			_, first := r.Read()
+			if first == nil || (tt.want != nil && !errors.Is(first, tt.want)) {
+				t.Fatalf("Read() error = %v, want %v", first, tt.want)
+			}
+			if _, second := r.Read(); second != first {
+				t.Errorf("second Read() error = %v, want %v", second, first)
+			}
+		})
+	}
 }
 
 // sortRows sorts the records after the header.
@@ -287,6 +332,9 @@ func wantRecords(t *testing.T, path string) [][]string {
 	return records
 }
 
+// smallBuffer holds the longest record of the fixtures, and little more.
+const smallBuffer = 16 * 1024
+
 func TestReader_fixtures(t *testing.T) {
 	paths, err := filepath.Glob("tests/*.csv")
 	if err != nil {
@@ -315,6 +363,12 @@ func TestReader_fixtures(t *testing.T) {
 			ordered := readAll(t, NewReader(open(t, path), WithOrder(), WithWorkers(4)))
 			if diff := cmp.Diff(want, ordered); diff != "" {
 				t.Errorf("Read() with WithOrder mismatch (-want +got):\n%.4000s", diff)
+			}
+
+			// a small buffer moves the records across many buffers
+			small := readAll(t, NewReader(open(t, path), WithOrder(), WithWorkers(4), WithBufferSize(smallBuffer)))
+			if diff := cmp.Diff(want, small); diff != "" {
+				t.Errorf("Read() with a %d byte buffer mismatch (-want +got):\n%.4000s", smallBuffer, diff)
 			}
 
 			sortRows(want)

@@ -32,7 +32,8 @@ const (
 	batchRecords = 128
 )
 
-var errClosed = errors.New("dsv: closed")
+// ErrClosed is returned by a Reader that was closed before its input ended.
+var ErrClosed = errors.New("dsv: reader closed")
 
 // Handler receives the records one worker splits. Run gives every worker a
 // Handler of its own and calls it from that worker only.
@@ -93,8 +94,12 @@ type Reader struct {
 	mu  sync.Mutex
 	err error
 
+	// optErr is the option NewReader could not accept
+	optErr error
+
 	// Read state
 	reading bool
+	readErr error
 	res     *result
 	resRec  int
 	resFlat uint32
@@ -144,9 +149,13 @@ type result struct {
 // Option configures a Reader.
 type Option func(*Reader)
 
-// WithDelimiter sets the delimiter instead of detecting it.
+// WithDelimiter sets the delimiter instead of detecting it. An empty delimiter
+// leaves the detection on.
 func WithDelimiter(delimiter []byte) Option {
 	return func(r *Reader) {
+		if len(delimiter) == 0 {
+			return
+		}
 		r.p.Characters.SetDelimiter(append(characters.Character{}, delimiter...))
 	}
 }
@@ -192,7 +201,9 @@ func WithExclude(columns ...int) Option {
 	}
 }
 
-// WithBufferSize sets the largest record, in bytes, the Reader accepts.
+// WithBufferSize sets the largest record, in bytes, the Reader accepts. The
+// default is 16 MiB. The input is read into buffers of this size; with records
+// near it a Reader holds up to five buffers per worker.
 func WithBufferSize(size int) Option {
 	return func(r *Reader) {
 		r.p.Buffersize = size
@@ -236,6 +247,9 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 	if r.workers < 1 {
 		r.workers = 1
 	}
+	if r.p.Buffersize < 1 {
+		r.optErr = fmt.Errorf("dsv: buffer size %d is below 1", r.p.Buffersize)
+	}
 	if r.p.Characters.Delimiter.Length() > 1 && len(r.p.Characters.Enclosure) == 0 {
 		r.p.Characters.EnclosureIsEmpty = true
 		r.p.NewlineDelimited = true
@@ -266,8 +280,13 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 
 // Header returns the names of the columns: a line break in a name is a space
 // and an unnamed column is named empty_column. It returns io.EOF for input
-// without a header. The names stay valid.
+// without a header. The names stay valid. A caller that does not go on to Run,
+// or to Read up to io.EOF, calls Close.
 func (r *Reader) Header() ([][]byte, error) {
+	if r.optErr != nil {
+		return nil, r.optErr
+	}
+
 	r.startOnce.Do(func() {
 		r.cutting.Add(1)
 		go r.cut()
@@ -320,10 +339,21 @@ func (r *Reader) Run(newHandler func() (Handler, error)) error {
 // The record and its fields are valid until the next call to Read. Read returns
 // io.EOF after the last record. A caller that stops before io.EOF calls Close.
 func (r *Reader) Read() ([][]byte, error) {
+	if r.readErr != nil {
+		return nil, r.readErr
+	}
+	select {
+	case <-r.quit:
+		r.readErr = r.failure()
+		return nil, r.readErr
+	default:
+	}
+
 	if !r.reading {
 		r.reading = true
 		names, err := r.Header()
 		if err != nil {
+			r.readErr = err
 			return nil, err
 		}
 
@@ -352,6 +382,7 @@ func (r *Reader) Read() ([][]byte, error) {
 
 		res, err := r.nextResult()
 		if err != nil {
+			r.readErr = err
 			return nil, err
 		}
 		r.res, r.resRec, r.resFlat, r.resLen = res, 0, 0, 0
@@ -373,11 +404,10 @@ func (r *Reader) ReadStrings() ([]string, error) {
 }
 
 // Close stops the Reader and waits for its goroutines. It waits for a Read of
-// the input that is in flight. Records not yet returned are lost.
+// the input that is in flight. Records not yet returned are lost: Run, and
+// Read unless it already returned io.EOF, return ErrClosed.
 func (r *Reader) Close() error {
-	r.quitOnce.Do(func() {
-		close(r.quit)
-	})
+	r.fail(ErrClosed)
 	r.cutting.Wait()
 	r.working.Wait()
 	return nil
@@ -606,7 +636,7 @@ func (r *Reader) cut() {
 	r.blk = r.getBlock()
 	for {
 		token, err := r.next()
-		if err == errClosed {
+		if err == ErrClosed {
 			return
 		}
 		if err != nil {
@@ -660,7 +690,7 @@ func (r *Reader) next() ([]byte, error) {
 			}
 			// the records cut so far stay in the old block, the rest of it moves
 			if !r.flush() {
-				return nil, errClosed
+				return nil, ErrClosed
 			}
 			blk := r.getBlock()
 			n := copy(blk.buf, r.blk.buf[r.off:r.end])
