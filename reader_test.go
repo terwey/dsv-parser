@@ -5,6 +5,7 @@ package dsv
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -385,6 +386,97 @@ func TestReader_fixtures(t *testing.T) {
 			sortRows(handled)
 			if diff := cmp.Diff(want, handled); diff != "" {
 				t.Errorf("Run() mismatch (-want +got):\n%.4000s", diff)
+			}
+		})
+	}
+}
+
+// loop is an input of a header followed by the same rows, times over.
+type loop struct {
+	header []byte
+	rows   []byte
+	times  int
+	rest   []byte
+}
+
+func (l *loop) Read(p []byte) (int, error) {
+	if len(l.rest) == 0 {
+		switch {
+		case l.header != nil:
+			l.rest, l.header = l.header, nil
+		case l.times > 0:
+			l.rest = l.rows
+			l.times--
+		default:
+			return 0, io.EOF
+		}
+	}
+
+	n := copy(p, l.rest)
+	l.rest = l.rest[n:]
+	return n, nil
+}
+
+// drop is a Handler that throws the records away.
+type drop struct{}
+
+func (drop) Record(row uint64, flat []byte, lengths []uint32) error {
+	return nil
+}
+
+func (drop) Close() error {
+	return nil
+}
+
+// BenchmarkReader_Run reads the rows of a fixture b.N times as one input and
+// drops the records. MB/s is the speed of cutting and splitting.
+func BenchmarkReader_Run(b *testing.B) {
+	benchmarks := []struct {
+		name    string
+		fixture string
+		opts    []Option
+	}{
+		{
+			name:    "pipe, enclosed, line breaks in fields",
+			fixture: "6f522d299731f73aad537914cfe0d68b.csv",
+		},
+		{
+			// no enclosure is ever found, so every record is searched for one
+			name:    "multi-byte delimiter, no enclosure",
+			fixture: "csvSample.512034.11822895.csv",
+		},
+		{
+			name:    "multi-byte delimiter, no enclosure, newline delimited",
+			fixture: "csvSample.512034.11822895.csv",
+			opts:    []Option{WithNewlineDelimited()},
+		},
+	}
+
+	for _, bb := range benchmarks {
+		b.Run(bb.name, func(b *testing.B) {
+			data, err := os.ReadFile(filepath.Join("tests", bb.fixture))
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			end := bytes.IndexByte(data, '\n') + 1
+			rows := data[end:]
+			if !bytes.HasSuffix(rows, []byte("\n")) {
+				rows = append(rows[:len(rows):len(rows)], '\n')
+			}
+
+			b.SetBytes(int64(len(rows)))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			r := NewReader(&loop{header: data[:end], rows: rows, times: b.N}, bb.opts...)
+			defer r.Close()
+
+			err = r.Run(func() (Handler, error) {
+				return drop{}, nil
+			})
+			if err != nil {
+				b.Fatal(err)
 			}
 		})
 	}
