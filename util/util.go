@@ -319,7 +319,14 @@ func FindEOLCharacter(in []byte) characters.Character {
 	// there is a chance that the header is LF and the rest of the file is CRLF
 	// the first line break decides: a CR followed by a LF is CRLF, a CR alone is CR, a LF is LF.
 	// Only in up to that line break is looked at, the rest of it can be megabytes.
-	first := bytes.IndexAny(in, "\r\n")
+	first := bytes.IndexByte(in, characters.Character_LINE_FEED[0])
+	head := in
+	if first != -1 {
+		head = in[:first]
+	}
+	if cr := bytes.IndexByte(head, characters.Character_CARRIAGE_RETURN[0]); cr != -1 {
+		first = cr
+	}
 	if first == -1 {
 		return characters.Character_EMPTY
 	}
