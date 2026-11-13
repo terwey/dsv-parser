@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path"
 	"reflect"
@@ -2733,6 +2734,28 @@ Dxmq égdskkotjh","RQWFCLEM","YÊVURJNVH","SBTO","JTCLWCHPFKEÜEOG","AZVZMAIBMID
 			}
 		})
 	}
+
+	// a one byte delimiter and enclosure are counted eight bytes at a time; the
+	// count equals that of the search for characters of any length
+	t.Run("generated", func(t *testing.T) {
+		alphabet := []byte(`ab,,""` + "\n';")
+		rng := rand.New(rand.NewSource(1))
+		for i := 0; i < 200000; i++ {
+			data := make([]byte, rng.Intn(60))
+			for j := range data {
+				data[j] = alphabet[rng.Intn(len(alphabet))]
+			}
+			sep, enclosure := characters.Character_COMMA, characters.Character_QUOTATION_MARK
+			if i%4 == 0 {
+				sep, enclosure = characters.Character_SEMICOLON, characters.Character_APOSTROPHE
+			}
+
+			got := CountOutsideEnclosure(data, sep, enclosure)
+			if want := countOutsideEnclosure(data, sep, enclosure); got != want {
+				t.Fatalf("CountOutsideEnclosure(%q, %q, %q) = %d, want %d", data, sep, enclosure, got, want)
+			}
+		}
+	})
 }
 
 var CountOutsideEnclosureResult int

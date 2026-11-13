@@ -12,6 +12,7 @@ import (
 
 	"github.com/terwey/dsv-parser/characters"
 	"github.com/terwey/dsv-parser/internal/debug"
+	"github.com/terwey/dsv-parser/internal/scan"
 	"golang.org/x/exp/slices"
 )
 
@@ -217,6 +218,29 @@ func ByteEqual(a, b []byte) bool {
 }
 
 func CountOutsideEnclosure(s []byte, sep, enclosure characters.Character) int {
+	if singleBytes(sep, enclosure) {
+		var counts scan.Counts
+		counts.Add(s, sep[0], enclosure[0])
+		return outsideOrZero(counts)
+	}
+	return countOutsideEnclosure(s, sep, enclosure)
+}
+
+// singleBytes reports whether sep and enclosure are one byte each, and not the same.
+func singleBytes(sep, enclosure characters.Character) bool {
+	return len(sep) == 1 && len(enclosure) == 1 && sep[0] != enclosure[0]
+}
+
+// outsideOrZero returns the delimiters outside an enclosure, or zero when an
+// enclosure is left open.
+func outsideOrZero(counts scan.Counts) int {
+	if counts.Enclosures%2 != 0 {
+		return 0
+	}
+	return counts.Outside
+}
+
+func countOutsideEnclosure(s []byte, sep, enclosure characters.Character) int {
 	// Fast path out
 	if len(sep) == 0 {
 		return -1
@@ -365,7 +389,29 @@ func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, tok
 	// end of the first line, before the index moves to a following EOL
 	var firstEolIndex int
 
+	// delimCounted bytes of in are counted in delimCount, enclCounted bytes in
+	// enclosureCount and outsideCounted bytes in outsideCounts: a record that
+	// goes on past a line break is counted once, not again from its start
+	var delimCounted, delimCount int
+	var enclCounted, enclosureCount int
+	var outsideCounted int
+	var outsideCounts scan.Counts
+
+	// outsideCount is CountOutsideEnclosure of in[:eolIndex]
+	outsideCount := func() int {
+		if outsideCounted == 0 && !singleBytes(c.Delimiter, c.Enclosure) {
+			return CountOutsideEnclosure(in[:eolIndex], c.Delimiter, c.Enclosure)
+		}
+		outsideCounts.Add(in[outsideCounted:eolIndex], c.Delimiter[0], c.Enclosure[0])
+		outsideCounted = eolIndex
+		return outsideOrZero(outsideCounts)
+	}
+
 findEolIndex:
+	delimCounted, delimCount = 0, 0
+	enclCounted, enclosureCount = 0, 0
+	outsideCounted, outsideCounts = 0, scan.Counts{}
+
 	eolIndex = bytes.Index(in, c.EOL)
 	// not enough bytes
 	if eolIndex == -1 {
@@ -457,8 +503,6 @@ findEolIndex:
 		}
 	}
 
-	var enclosureCount int
-
 	// we want to loop over the possible eolIndex
 	for ; ; stuckCount++ {
 		// count the delimiters
@@ -490,7 +534,17 @@ findEolIndex:
 			debug.BreakMe()
 		}
 
-		c.DelimCounted = bytes.Count(in[:eolIndex], c.Delimiter)
+		// a PHP escape is rewritten in place, and a character of several bytes
+		// can lie across the end of what was counted: count those from the start
+		if c.PHP || !singleBytes(c.Delimiter, c.Enclosure) {
+			delimCounted, delimCount = 0, 0
+			enclCounted, enclosureCount = 0, 0
+			outsideCounted, outsideCounts = 0, scan.Counts{}
+		}
+
+		delimCount += bytes.Count(in[delimCounted:eolIndex], c.Delimiter)
+		delimCounted = eolIndex
+		c.DelimCounted = delimCount
 
 		// NOTE: the enclosure can still be set to none if this is the first time returning a chunk after detecting the delimiter
 		// in case the enclosure is set to be none, we only have to test for the amount of delimiters
@@ -511,7 +565,8 @@ findEolIndex:
 			return eolIndex + len(c.EOL), in[:eolIndex], nil
 		}
 
-		enclosureCount = bytes.Count(in[:eolIndex], c.Enclosure)
+		enclosureCount += bytes.Count(in[enclCounted:eolIndex], c.Enclosure)
+		enclCounted = eolIndex
 
 		if c.EnclosureLength() != 0 && enclosureCount == 0 && c.NdMoved == 0 {
 			if debug.DebugLog {
@@ -542,7 +597,7 @@ findEolIndex:
 
 				if bytes.Contains(in[:eolIndex], []byte(`{`)) {
 					// massive slowdown but needed for files with embedded JSON
-					if c.DelimOutsideCounted = CountOutsideEnclosure(in[:eolIndex], c.Delimiter, c.Enclosure); c.DelimOutsideCounted != c.DelimiterCount {
+					if c.DelimOutsideCounted = outsideCount(); c.DelimOutsideCounted != c.DelimiterCount {
 						goto moveindex
 					}
 				}
@@ -552,7 +607,7 @@ findEolIndex:
 			}
 
 			// it is possible that the delimiter appears within the enclosure
-			if c.DelimOutsideCounted = CountOutsideEnclosure(in[:eolIndex], c.Delimiter, c.Enclosure); c.DelimOutsideCounted == c.DelimiterCount {
+			if c.DelimOutsideCounted = outsideCount(); c.DelimOutsideCounted == c.DelimiterCount {
 				if debug.DebugLog {
 					debug.LogData("[SplitCsvInput]CountOutsideEnclosure is the same as the DelimiterCount", in[:eolIndex], 40960)
 					debug.BreakMe()
@@ -613,7 +668,7 @@ findEolIndex:
 			}
 		}
 
-		if bytes.Count(in[:eolIndex], c.Delimiter) >= (c.DelimiterCount * 2) {
+		if c.DelimCounted >= (c.DelimiterCount * 2) {
 			if stuckCount > 100 {
 				fmt.Printf("Stuck (%d) on chunking: \n+++\n%s\n+++\n", stuckCount, in[:eolIndex])
 				fmt.Printf("[SplitCsvInput] eolIndex: %d, c.EOL: %x\tdelimiter count: %d\t"+
@@ -779,7 +834,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 	tries := 50
 	i := 0
 	for {
-		if i == tries {
+		if i >= tries {
 			break
 		}
 		if len(in) < tmpEolIndex {
