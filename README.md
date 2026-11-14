@@ -135,10 +135,11 @@ err = r.Run(func() (dsv.Handler, error) {
 ## Starting again after a break
 
 A stream can break halfway: a network upload, a pipe. A `Reader` does not have to start at the first byte again.
-`Reader.Checkpoint` returns the last place a new `Reader` can start from, and `WithCheckpoint` starts one there.
+With `WithCheckpoints()` it keeps checkpoints: `Reader.Checkpoint` returns the last place a new `Reader` can start
+from, and `WithCheckpoint` starts one there.
 
 ```go
-r := dsv.NewReader(stream, options...)
+r := dsv.NewReader(stream, append(options, dsv.WithCheckpoints())...)
 err := r.Run(newHandler)
 
 // err is the error of the stream; the checkpoint is still valid
@@ -149,6 +150,9 @@ r = dsv.NewReader(rest, append(options, dsv.WithCheckpoint(checkpoint))...)
 err = r.Run(newHandler)
 ```
 
+- **It is off unless asked for.** A `Reader` without `WithCheckpoints()` or `WithCheckpoint` keeps no checkpoints and
+  pays nothing for them; `Checkpoint` then returns the zero value. `WithCheckpoint` keeps them too, and the zero
+  `Checkpoint` is the start of the input, so a loop can pass the last checkpoint it has every time.
 - **What a checkpoint is.** The end of a record that was delivered with every record before it: `Offset` is the number
   of input bytes before it, `Row` the number of its last record. It also carries the header and everything the first
   `Reader` detected, so the second one reads no header and detects nothing again.
@@ -182,7 +186,8 @@ err = r.Run(newHandler)
 | `WithBufferSize(n)` | The largest record, in bytes. | 16 MiB |
 | `WithWorkers(n)` | The number of workers that split records. | One per CPU |
 | `WithOrder()` | Makes `Read` return records in input order. | Off |
-| `WithCheckpoint(c)` | Starts at a checkpoint of an earlier `Reader`; the input starts at its `Offset`. | The start of the input |
+| `WithCheckpoints()` | Keeps checkpoints for `Reader.Checkpoint` to return. | Off |
+| `WithCheckpoint(c)` | Starts at a checkpoint of an earlier `Reader`; the input starts at its `Offset`. Keeps checkpoints. | The start of the input |
 
 ## What you get back
 

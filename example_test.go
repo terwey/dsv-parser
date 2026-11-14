@@ -104,7 +104,7 @@ func ExampleReader_Checkpoint() {
 	broken := io.MultiReader(strings.NewReader(input[:42]), iotest.ErrReader(io.ErrUnexpectedEOF))
 
 	// a small buffer puts the checkpoints of this short input close together
-	options := []dsv.Option{dsv.WithWorkers(1), dsv.WithBufferSize(16)}
+	options := []dsv.Option{dsv.WithWorkers(1), dsv.WithBufferSize(16), dsv.WithCheckpoints()}
 
 	r := dsv.NewReader(broken, options...)
 	err := r.Run(func() (dsv.Handler, error) {

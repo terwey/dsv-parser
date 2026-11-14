@@ -690,6 +690,9 @@ func TestReader_Checkpoint(t *testing.T) {
 				if err := whole.Run(func() (Handler, error) { return rowKeeper{&mu, want}, nil }); err != nil {
 					t.Fatalf("Run(): %s", err)
 				}
+				if kept := whole.Checkpoint(); kept.Offset != 0 || kept.Row != 0 {
+					t.Errorf("Checkpoint() without WithCheckpoints = offset %d row %d, want the zero Checkpoint", kept.Offset, kept.Row)
+				}
 
 				got := make(map[uint64][]string)
 				var checkpoint Checkpoint

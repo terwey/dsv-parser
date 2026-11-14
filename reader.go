@@ -92,7 +92,10 @@ type Reader struct {
 	// base is the input offset of the first byte of blk
 	base int64
 
-	progress progress
+	// checkpoints is set when the Reader keeps checkpoints: without it the
+	// cutter takes no state and the workers report nothing to progress
+	checkpoints bool
+	progress    progress
 	// resume is the checkpoint the Reader started from
 	resume Checkpoint
 
@@ -392,17 +395,27 @@ func WithFixedLineEnding() Option {
 	}
 }
 
-// WithCheckpoint starts the Reader at a Checkpoint another Reader returned.
-// Give it the options that Reader had. The input starts at the checkpoint's
-// Offset and holds no header: Header, and the first Read, return the names the
-// checkpoint carries. Rows are numbered on from the checkpoint's Row. The
-// delimiter, enclosure, line ending and excluded columns are those of the
-// checkpoint; nothing is detected again. WithStart and WithSkip do not apply
-// to the input given, WithLimit counts the rows before the checkpoint too. The
-// zero Checkpoint changes nothing.
+// WithCheckpoints makes the Reader keep checkpoints, for Checkpoint to return.
+// Without it a Reader keeps none and pays nothing for them.
+func WithCheckpoints() Option {
+	return func(r *Reader) {
+		r.checkpoints = true
+	}
+}
+
+// WithCheckpoint starts the Reader at a Checkpoint another Reader returned, and
+// makes it keep checkpoints as WithCheckpoints does. Give it the options that
+// Reader had. The input starts at the checkpoint's Offset and holds no header:
+// Header, and the first Read, return the names the checkpoint carries. Rows are
+// numbered on from the checkpoint's Row. The delimiter, enclosure, line ending
+// and excluded columns are those of the checkpoint; nothing is detected again.
+// WithStart and WithSkip do not apply to the input given, WithLimit counts the
+// rows before the checkpoint too. The zero Checkpoint is the start of the
+// input: the Reader reads it as one without a checkpoint does.
 func WithCheckpoint(c Checkpoint) Option {
 	return func(r *Reader) {
 		r.resume = c
+		r.checkpoints = true
 	}
 }
 
@@ -551,7 +564,9 @@ func (r *Reader) restore() error {
 
 // Checkpoint returns the last place a Reader can start from again with
 // WithCheckpoint: the end of a record that was delivered with every record
-// before it. A record is delivered when Read returned it and Read was called
+// before it. The Reader keeps checkpoints only when it was given
+// WithCheckpoints or WithCheckpoint; without them Checkpoint returns the zero
+// Checkpoint. A record is delivered when Read returned it and Read was called
 // again, or under Run when Record returned nil for it. Checkpoints lie up to
 // 4096 records or 256 KiB of input apart, so records after the checkpoint can
 // have been delivered as well: a Reader started from it delivers them again,
@@ -669,7 +684,9 @@ func (r *Reader) Read() ([][]byte, error) {
 			if r.resRec < len(r.res.fields) {
 				return r.nextFields(), nil
 			}
-			r.progress.deliver(r.res.seq, true)
+			if r.checkpoints {
+				r.progress.deliver(r.res.seq, true)
+			}
 			r.resultPool.Put(r.res)
 			r.res = nil
 		}
@@ -817,12 +834,16 @@ func (r *Reader) handle(h Handler) {
 				}
 				if err := h.Record(b.first+uint64(i), flat, lens); err != nil {
 					r.fail(err)
-					r.progress.deliver(b.seq, false)
+					if r.checkpoints {
+						r.progress.deliver(b.seq, false)
+					}
 					r.putBatch(b)
 					return
 				}
 			}
-			r.progress.deliver(b.seq, true)
+			if r.checkpoints {
+				r.progress.deliver(b.seq, true)
+			}
 			r.putBatch(b)
 		}
 	}
@@ -1091,12 +1112,13 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 // flush sends the current batch to the workers. It returns false when the
 // Reader was closed. resumable is true when the cutter has not looked past the
 // last record of the batch for anything but that record's own cut: its state
-// is then the one a Reader starts with after the batch.
+// is then the one a Reader starts with after the batch, kept when the Reader
+// keeps checkpoints.
 func (r *Reader) flush(resumable bool) bool {
 	if r.cur == nil {
 		return true
 	}
-	if resumable {
+	if resumable && r.checkpoints {
 		r.progress.add(r.cur.seq, state{
 			cfg:             *r.p.Characters,
 			delimSet:        r.delimSet,
