@@ -665,6 +665,17 @@ func (r *Reader) record(token []byte) bool {
 		return true
 	}
 
+	if r.headerRead {
+		if r.skipped < r.skip {
+			r.skipped++
+			return true
+		}
+		if r.limit >= 0 && r.row == uint64(r.limit) {
+			r.limited = true
+			return true
+		}
+	}
+
 	chunk := token
 	if r.p.Characters.Excel {
 		chunk = bytes.TrimSuffix(chunk, r.p.Characters.Delimiter)
