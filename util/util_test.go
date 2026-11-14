@@ -603,6 +603,32 @@ func getTestData() []TestData {
 			enclosure: characters.Character_QUOTATION_MARK,
 		},
 		{
+			name: "quoted delimiter before a line break in the middle of three columns",
+			in:   []byte("code,description,gtin\n1,\"x, w\ny\",3\n2,plain,4"),
+			multiOut: [][]byte{
+				[]byte("code,description,gtin"),
+				[]byte("1,\"x, w\ny\",3"),
+				[]byte("2,plain,4"),
+			},
+			advance:   22,
+			out:       []byte("code,description,gtin"),
+			delimiter: characters.Character_COMMA,
+			enclosure: characters.Character_QUOTATION_MARK,
+		},
+		{
+			name: "quoted delimiters before a line break bring four columns to the header's count",
+			in:   []byte("code,description,gtin,n\n1,\"x, w, v\ny\",3,9\n2,plain,4,9"),
+			multiOut: [][]byte{
+				[]byte("code,description,gtin,n"),
+				[]byte("1,\"x, w, v\ny\",3,9"),
+				[]byte("2,plain,4,9"),
+			},
+			advance:   24,
+			out:       []byte("code,description,gtin,n"),
+			delimiter: characters.Character_COMMA,
+			enclosure: characters.Character_QUOTATION_MARK,
+		},
+		{
 			name: "unclosed quote in the last of two columns",
 			in:   []byte("id,title\n1,\"Foo\"\n2,\"Bar\n3,Row3\n4,\"Baz\"\n5,Last"),
 			multiOut: [][]byte{
