@@ -6,6 +6,7 @@ package util
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"unicode/utf8"
@@ -125,6 +126,91 @@ type CharacterConfig struct {
 	searchedPlain     int
 	searchedEOL       characters.Character
 	searchedDelimiter characters.Character
+}
+
+// characterState is the encoded form of a CharacterConfig: what SplitCsvInput
+// carries from one record to the next.
+type characterState struct {
+	Delimiter        []byte
+	Enclosure        []byte
+	EnclosureIsEmpty bool
+	DoubleEnclosure  []byte
+	EOL              []byte
+	EscapeCharacter  []byte
+	EscapedEnclosure []byte
+	EnclosureClean   bool
+
+	DelimiterCount      int
+	ClearedEOL          bool
+	EOLBuf              []byte
+	Excel               bool
+	PHP                 bool
+	DelimCounted        int
+	DelimOutsideCounted int
+	NdMoved             int
+	ReturnEarly         bool
+	FixedEOL            bool
+}
+
+// MarshalBinary encodes the state SplitCsvInput carries from one record to the
+// next. BufferSize is not part of it.
+func (c CharacterConfig) MarshalBinary() ([]byte, error) {
+	return json.Marshal(characterState{
+		Delimiter:        c.Delimiter,
+		Enclosure:        c.Enclosure,
+		EnclosureIsEmpty: c.EnclosureIsEmpty,
+		DoubleEnclosure:  c.DoubleEnclosure,
+		EOL:              c.EOL,
+		EscapeCharacter:  c.EscapeCharacter,
+		EscapedEnclosure: c.EscapedEnclosure,
+		EnclosureClean:   c.EnclosureClean,
+
+		DelimiterCount:      c.DelimiterCount,
+		ClearedEOL:          c.clearedEOL,
+		EOLBuf:              c.eolBuf,
+		Excel:               c.Excel,
+		PHP:                 c.PHP,
+		DelimCounted:        c.DelimCounted,
+		DelimOutsideCounted: c.DelimOutsideCounted,
+		NdMoved:             c.NdMoved,
+		ReturnEarly:         c.ReturnEarly,
+		FixedEOL:            c.FixedEOL,
+	})
+}
+
+// UnmarshalBinary sets c to the state MarshalBinary encoded: SplitCsvInput
+// then cuts the input after that state as the CharacterConfig it came from
+// would have. BufferSize keeps its value.
+func (c *CharacterConfig) UnmarshalBinary(data []byte) error {
+	var st characterState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return err
+	}
+
+	size := c.BufferSize
+	*c = CharacterConfig{BufferSize: size}
+	// SetEnclosure sets the enclosure length; the fields it derives are overwritten below
+	c.SetEnclosure(st.Enclosure)
+	c.Delimiter = st.Delimiter
+	c.Enclosure = st.Enclosure
+	c.EnclosureIsEmpty = st.EnclosureIsEmpty
+	c.DoubleEnclosure = st.DoubleEnclosure
+	c.EOL = st.EOL
+	c.EscapeCharacter = st.EscapeCharacter
+	c.EscapedEnclosure = st.EscapedEnclosure
+	c.EnclosureClean = st.EnclosureClean
+
+	c.DelimiterCount = st.DelimiterCount
+	c.clearedEOL = st.ClearedEOL
+	c.eolBuf = st.EOLBuf
+	c.Excel = st.Excel
+	c.PHP = st.PHP
+	c.DelimCounted = st.DelimCounted
+	c.DelimOutsideCounted = st.DelimOutsideCounted
+	c.NdMoved = st.NdMoved
+	c.ReturnEarly = st.ReturnEarly
+	c.FixedEOL = st.FixedEOL
+	return nil
 }
 
 func NewCharacterConfig(delimiter, enclosure characters.Character) *CharacterConfig {

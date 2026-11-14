@@ -9,6 +9,7 @@ import (
 	"log"
 	"strings"
 	"sync/atomic"
+	"testing/iotest"
 
 	dsv "github.com/terwey/dsv-parser"
 )
@@ -82,4 +83,57 @@ func ExampleReader_Run() {
 	// Output:
 	// ["id" "name" "city"]
 	// 3 records, 8 fields with a value
+}
+
+// printer is a Handler that prints every record under its row number.
+type printer struct{}
+
+func (printer) Record(row uint64, flat []byte, lengths []uint32) error {
+	fmt.Printf("row %d: %s\n", row, flat[lengths[0]:])
+	return nil
+}
+
+func (printer) Close() error {
+	return nil
+}
+
+func ExampleReader_Checkpoint() {
+	input := "id,name\n1,Ada\n2,Bob\n3,Cyd\n4,Dee\n5,Eve\n6,Fay\n7,Gus\n8,Hal\n"
+
+	// the stream breaks inside the sixth record
+	broken := io.MultiReader(strings.NewReader(input[:42]), iotest.ErrReader(io.ErrUnexpectedEOF))
+
+	// a small buffer puts the checkpoints of this short input close together
+	options := []dsv.Option{dsv.WithWorkers(1), dsv.WithBufferSize(16)}
+
+	r := dsv.NewReader(broken, options...)
+	err := r.Run(func() (dsv.Handler, error) {
+		return printer{}, nil
+	})
+	fmt.Println("stopped:", err)
+
+	checkpoint := r.Checkpoint()
+	fmt.Printf("checkpoint: %d bytes, row %d\n", checkpoint.Offset, checkpoint.Row)
+
+	// the sender sends the input again from the checkpoint's offset
+	rest := strings.NewReader(input[checkpoint.Offset:])
+
+	r = dsv.NewReader(rest, append(options, dsv.WithCheckpoint(checkpoint))...)
+	err = r.Run(func() (dsv.Handler, error) {
+		return printer{}, nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Output:
+	// row 1: Ada
+	// row 2: Bob
+	// row 3: Cyd
+	// row 4: Dee
+	// stopped: unexpected EOF
+	// checkpoint: 32 bytes, row 4
+	// row 5: Eve
+	// row 6: Fay
+	// row 7: Gus
+	// row 8: Hal
 }
