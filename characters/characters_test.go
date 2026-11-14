@@ -147,6 +147,20 @@ func Test_detectEnclosure(t *testing.T) {
 			debug:     false,
 		},
 		{
+			name:      "Detect quote after a column of one repeated character",
+			data:      []byte("1,000,\"a b\""),
+			want:      Character_QUOTATION_MARK,
+			delimiter: Character_COMMA,
+			count:     2,
+		},
+		{
+			name:      "Detect quote of a multi-line value after a column of one repeated character",
+			data:      []byte("7,xxxxxxxx,c,\"multi\nline\""),
+			want:      Character_QUOTATION_MARK,
+			delimiter: Character_COMMA,
+			count:     2,
+		},
+		{
 			name:      "Detect quote when values contain quotes",
 			data:      []byte("a,b,c\n\"\"\"x\"\"\",\"\"\"y\"\"\",\"z\"\n\"\"\"p\"\"\",\"\"\"q\"\"\",\"r\""),
 			want:      Character_QUOTATION_MARK,
