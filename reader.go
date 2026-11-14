@@ -303,6 +303,7 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 	if r.p.Buffersize < 1 {
 		r.optErr = fmt.Errorf("dsv: buffer size %d is below 1", r.p.Buffersize)
 	}
+	r.p.Characters.BufferSize = r.p.Buffersize
 	if r.p.Characters.Delimiter.Length() > 1 && len(r.p.Characters.Enclosure) == 0 {
 		r.p.Characters.EnclosureIsEmpty = true
 		r.p.NewlineDelimited = true

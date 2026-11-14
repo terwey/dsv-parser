@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/exp/slices"
@@ -258,6 +259,109 @@ func TestRegressionReader_Read_shortBufferTail(t *testing.T) {
 	}
 	if records != rows+1 {
 		t.Errorf("Read() returned %d records, want %d", records, rows+1)
+	}
+}
+
+func TestRegressionReader_Read_shortReads(t *testing.T) {
+	set := []Option{WithDelimiter([]byte(",")), WithEnclosure([]byte(`"`))}
+
+	tests := []struct {
+		name  string
+		input string
+		opts  []Option
+		// buffer is the smallest buffer read with: it holds the longest record
+		// with its line break, and the bytes after a record its cut looks at
+		buffer int
+		want   [][]string
+	}{
+		{
+			name:   "line break in an enclosure, LF, detected",
+			input:  "id,text\n0,\"two\nlines\"\n1,\"two\nlines\"\n",
+			buffer: 14,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, CRLF, detected",
+			input:  "id,text\r\n0,\"two\r\nlines\"\r\n1,\"two\r\nlines\"\r\n",
+			buffer: 16,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, LF, set",
+			input:  "id,text\n0,\"two\nlines\"\n1,\"two\nlines\"\n",
+			opts:   set,
+			buffer: 14,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, CRLF, set",
+			input:  "id,text\r\n0,\"two\r\nlines\"\r\n1,\"two\r\nlines\"\r\n",
+			opts:   set,
+			buffer: 16,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, CR, detected",
+			input:  "id,text\r0,\"two\rlines\"\r1,one\r",
+			buffer: 14,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "one"}},
+		},
+		{
+			name:   "apostrophes before the enclosure on a line, LF, detected",
+			input:  "id,a,b,c,d\n1,'a',\"b\",\"c\",\"d\"\n",
+			buffer: 19,
+			want:   [][]string{{"id", "a", "b", "c", "d"}, {"1", "'a'", "b", "c", "d"}},
+		},
+		{
+			name:   "delimiter and line break in an enclosure, CRLF, detected",
+			input:  "id;text\r\n1;\"a;b\r\nc\"\r\n2;plain\r\n",
+			buffer: 12,
+			want:   [][]string{{"id", "text"}, {"1", "a;b\nc"}, {"2", "plain"}},
+		},
+		// the stray enclosure is told from an open one by the field the next record opens
+		{
+			name:   "stray enclosure, CRLF, set",
+			input:  "id,size\r\n1,55\"\r\n2,\"a,b\r\nc\"\r\n",
+			opts:   set,
+			buffer: 18,
+			want:   [][]string{{"id", "size"}, {"1", `55"`}, {"2", "a,b\nc"}},
+		},
+		{
+			name:   "line break in an enclosed header, CRLF, set",
+			input:  "\"id\",\"te\r\nxt\"\r\n1,2\r\n",
+			opts:   set,
+			buffer: 15,
+			want:   [][]string{{"id", "te xt"}, {"1", "2"}},
+		},
+	}
+
+	readers := []struct {
+		name string
+		wrap func(io.Reader) io.Reader
+	}{
+		{name: "whole", wrap: func(r io.Reader) io.Reader { return r }},
+		{name: "one byte", wrap: iotest.OneByteReader},
+		{name: "half", wrap: iotest.HalfReader},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := append([]Option{WithOrder()}, tt.opts...)
+			for _, rd := range readers {
+				got := readAll(t, NewReader(rd.wrap(strings.NewReader(tt.input)), opts...))
+				if diff := cmp.Diff(tt.want, got); diff != "" {
+					t.Errorf("Read() from a %s reader mismatch (-want +got):\n%s", rd.name, diff)
+				}
+			}
+
+			// the buffer sizes from tt.buffer up end a buffer on every byte of the input
+			for size := tt.buffer; size <= len(tt.input); size++ {
+				got := readAll(t, NewReader(strings.NewReader(tt.input), append(opts, WithBufferSize(size))...))
+				if diff := cmp.Diff(tt.want, got); diff != "" {
+					t.Errorf("Read() with a %d byte buffer mismatch (-want +got):\n%s", size, diff)
+				}
+			}
+		})
 	}
 }
 
