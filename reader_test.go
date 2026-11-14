@@ -857,12 +857,16 @@ func TestProgress_deliver(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var p progress
-			for _, d := range tt.deliveries {
-				var after *state
+			// the cutter adds the states in input order, before any batch is delivered
+			cut := append([]delivery(nil), tt.deliveries...)
+			slices.SortFunc(cut, func(a, b delivery) bool { return a.seq < b.seq })
+			for _, d := range cut {
 				if d.offset != 0 {
-					after = &state{offset: d.offset}
+					p.add(d.seq, state{offset: d.offset})
 				}
-				p.deliver(d.seq, after, d.whole)
+			}
+			for _, d := range tt.deliveries {
+				p.deliver(d.seq, d.whole)
 			}
 			if p.at.offset != tt.want || p.reached != (tt.want != 0) {
 				t.Errorf("state reached = offset %d (reached %t), want offset %d", p.at.offset, p.reached, tt.want)

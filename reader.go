@@ -158,9 +158,6 @@ type batch struct {
 	cfg   util.CharacterConfig
 	first uint64
 	seq   uint64
-	// after is the state of the cutter past the last record, set when resumable is
-	after     state
-	resumable bool
 }
 
 // state is what the cutter carries from one record to the next: a Reader given
@@ -181,9 +178,6 @@ type result struct {
 	flat   []byte
 	lens   []uint32
 	fields []uint32
-	// after and resumable are those of the batch
-	after     state
-	resumable bool
 }
 
 // progress is the state after the last batch delivered with every batch before it.
@@ -194,51 +188,69 @@ type progress struct {
 	reached bool
 	// next is the sequence number of the first batch not delivered
 	next uint64
-	// ahead holds the batches after next that were delivered
-	ahead map[uint64]delivered
+	// cut holds, from head on and in input order, the state past every batch
+	// from next on that a Reader can start after
+	cut  []cutState
+	head int
+	// ahead holds the batches after next that were delivered, and whether whole
+	ahead map[uint64]bool
 	// stopped is set once a batch was not delivered whole
 	stopped bool
 }
 
-type delivered struct {
-	after     state
-	resumable bool
-	whole     bool
+// cutState is the state of the cutter past batch seq.
+type cutState struct {
+	seq   uint64
+	after state
 }
 
-// deliver records that the records of batch seq were delivered: all of them
-// when whole is true. after is the state past the batch, nil when a Reader
-// cannot start there.
-func (p *progress) deliver(seq uint64, after *state, whole bool) {
+// add keeps the state past batch seq. The cutter calls it before it sends the
+// batch, in input order, for a batch a Reader can start after.
+func (p *progress) add(seq uint64, after state) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.stopped {
 		return
 	}
-	d := delivered{whole: whole}
-	if after != nil {
-		d.after, d.resumable = *after, true
+	p.cut = append(p.cut, cutState{seq: seq, after: after})
+}
+
+// deliver records that the records of batch seq were delivered: all of them
+// when whole is true.
+func (p *progress) deliver(seq uint64, whole bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return
 	}
 	if seq != p.next {
 		if p.ahead == nil {
-			p.ahead = make(map[uint64]delivered)
+			p.ahead = make(map[uint64]bool)
 		}
-		p.ahead[seq] = d
+		p.ahead[seq] = whole
 		return
 	}
 
 	for {
-		if !d.whole {
+		if !whole {
 			p.stopped = true
 			return
 		}
-		if d.resumable {
-			p.at, p.reached = d.after, true
+		if p.head < len(p.cut) && p.cut[p.head].seq == p.next {
+			p.at, p.reached = p.cut[p.head].after, true
+			p.head++
+			// the states passed make room once they are half of the slice
+			if p.head == len(p.cut) {
+				p.cut, p.head = p.cut[:0], 0
+			} else if p.head >= 16 && 2*p.head >= len(p.cut) {
+				p.cut, p.head = p.cut[:copy(p.cut, p.cut[p.head:])], 0
+			}
 		}
 		p.next++
 		var ok bool
-		if d, ok = p.ahead[p.next]; !ok {
+		if whole, ok = p.ahead[p.next]; !ok {
 			return
 		}
 		delete(p.ahead, p.next)
@@ -291,21 +303,6 @@ func (c *Checkpoint) UnmarshalJSON(data []byte) error {
 	}
 	c.Offset, c.Row, c.state = v.Offset, v.Row, v.State
 	return nil
-}
-
-// resumeState returns the state past the batch, nil when a Reader cannot start there.
-func (b *batch) resumeState() *state {
-	if !b.resumable {
-		return nil
-	}
-	return &b.after
-}
-
-func (res *result) resumeState() *state {
-	if !res.resumable {
-		return nil
-	}
-	return &res.after
 }
 
 // Option configures a Reader.
@@ -672,7 +669,7 @@ func (r *Reader) Read() ([][]byte, error) {
 			if r.resRec < len(r.res.fields) {
 				return r.nextFields(), nil
 			}
-			r.progress.deliver(r.res.seq, r.res.resumeState(), true)
+			r.progress.deliver(r.res.seq, true)
 			r.resultPool.Put(r.res)
 			r.res = nil
 		}
@@ -820,12 +817,12 @@ func (r *Reader) handle(h Handler) {
 				}
 				if err := h.Record(b.first+uint64(i), flat, lens); err != nil {
 					r.fail(err)
-					r.progress.deliver(b.seq, nil, false)
+					r.progress.deliver(b.seq, false)
 					r.putBatch(b)
 					return
 				}
 			}
-			r.progress.deliver(b.seq, b.resumeState(), true)
+			r.progress.deliver(b.seq, true)
 			r.putBatch(b)
 		}
 	}
@@ -854,7 +851,7 @@ func (r *Reader) work() {
 			if res == nil {
 				res = &result{}
 			}
-			res.seq, res.after, res.resumable = b.seq, b.after, b.resumable
+			res.seq = b.seq
 			res.flat, res.lens, res.fields = res.flat[:0], res.lens[:0], res.fields[:0]
 
 			size := 0
@@ -929,7 +926,6 @@ func (r *Reader) putBatch(b *batch) {
 	}
 	b.recs = b.recs[:0]
 	b.size = 0
-	b.after, b.resumable = state{}, false
 	r.batchPool.Put(b)
 }
 
@@ -1101,15 +1097,14 @@ func (r *Reader) flush(resumable bool) bool {
 		return true
 	}
 	if resumable {
-		r.cur.resumable = true
-		r.cur.after = state{
+		r.progress.add(r.cur.seq, state{
 			cfg:             *r.p.Characters,
 			delimSet:        r.delimSet,
 			enclosureSet:    r.enclosureSet,
 			enclDetectCount: r.enclDetectCount,
 			offset:          r.base + int64(r.off),
 			row:             r.row,
-		}
+		})
 	}
 
 	select {
