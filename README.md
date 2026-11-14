@@ -132,6 +132,43 @@ err = r.Run(func() (dsv.Handler, error) {
 
 `Run` returns when the input is read and every `Handler` is closed. Use either `Run` or `Read` on one `Reader`.
 
+## Starting again after a break
+
+A stream can break halfway: a network upload, a pipe. A `Reader` does not have to start at the first byte again.
+With `WithCheckpoints()` it keeps checkpoints: `Reader.Checkpoint` returns the last place a new `Reader` can start
+from, and `WithCheckpoint` starts one there.
+
+```go
+r := dsv.NewReader(stream, append(options, dsv.WithCheckpoints())...)
+err := r.Run(newHandler)
+
+// err is the error of the stream; the checkpoint is still valid
+checkpoint := r.Checkpoint()
+
+// ask the sender for the input from checkpoint.Offset on, then
+r = dsv.NewReader(rest, append(options, dsv.WithCheckpoint(checkpoint))...)
+err = r.Run(newHandler)
+```
+
+- **It is off unless asked for.** A `Reader` without `WithCheckpoints()` or `WithCheckpoint` keeps no checkpoints and
+  pays nothing for them; `Checkpoint` then returns the zero value. `WithCheckpoint` keeps them too, and the zero
+  `Checkpoint` is the start of the input, so a loop can pass the last checkpoint it has every time.
+- **What a checkpoint is.** The end of a record that was delivered with every record before it: `Offset` is the number
+  of input bytes before it, `Row` the number of its last record. It also carries the header and everything the first
+  `Reader` detected, so the second one reads no header and detects nothing again.
+- **Delivered** means `Record` returned nil for the record, or `Read` returned it and was called again.
+- **Row numbers go on.** The first record after the checkpoint is row `Row + 1`.
+- **Some records come twice.** Checkpoints lie up to 4096 records or 256 KiB apart, and workers run ahead of each
+  other. Records after the checkpoint can have been delivered before the break; the second `Reader` delivers them
+  again under the same row numbers. With `Run`, drop or overwrite by row number. With `Read`, keep what you read only
+  once `Checkpoint` has moved past it.
+- **A break delivers what had arrived.** Before `Run` or `Read` returns an error of the input, the workers finish the
+  whole records cut up to it.
+- **It can be stored.** A `Checkpoint` marshals to JSON, a few KiB with a wide header, so it survives a restart of the
+  process. Call `Checkpoint` during `Run` to store one now and then; it is safe to call from another goroutine.
+- **Options.** Give the second `Reader` the options of the first. `WithStart` and `WithSkip` do not apply to it,
+  `WithLimit` counts the rows before the checkpoint too.
+
 ## Options
 
 | Option | What it does | Default |
@@ -149,6 +186,8 @@ err = r.Run(func() (dsv.Handler, error) {
 | `WithBufferSize(n)` | The largest record, in bytes. | 16 MiB |
 | `WithWorkers(n)` | The number of workers that split records. | One per CPU |
 | `WithOrder()` | Makes `Read` return records in input order. | Off |
+| `WithCheckpoints()` | Keeps checkpoints for `Reader.Checkpoint` to return. | Off |
+| `WithCheckpoint(c)` | Starts at a checkpoint of an earlier `Reader`; the input starts at its `Offset`. Keeps checkpoints. | The start of the input |
 
 ## What you get back
 
@@ -168,7 +207,8 @@ err = r.Run(func() (dsv.Handler, error) {
 - `Read` returns `io.EOF` after the last record. `Header` returns `io.EOF` for input without a header.
 - A record longer than the buffer returns an error that wraps `bufio.ErrTooLong`. A wrong delimiter or enclosure
   can cause the same error, when the parser never finds the end of a record.
-- An error from the input, or from a `Handler`, is returned as it is.
+- An error from the input, or from a `Handler`, is returned as it is. An error from the input is returned after the
+  records cut before it were delivered.
 - Once `Read` has returned an error it returns that error on every later call.
 - `Close` stops the `Reader` and waits for its goroutines. Call it when you stop before the end. A `Reader` closed
   before its input ended returns `ErrClosed`.

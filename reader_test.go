@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/exp/slices"
@@ -261,6 +263,109 @@ func TestRegressionReader_Read_shortBufferTail(t *testing.T) {
 	}
 }
 
+func TestRegressionReader_Read_shortReads(t *testing.T) {
+	set := []Option{WithDelimiter([]byte(",")), WithEnclosure([]byte(`"`))}
+
+	tests := []struct {
+		name  string
+		input string
+		opts  []Option
+		// buffer is the smallest buffer read with: it holds the longest record
+		// with its line break, and the bytes after a record its cut looks at
+		buffer int
+		want   [][]string
+	}{
+		{
+			name:   "line break in an enclosure, LF, detected",
+			input:  "id,text\n0,\"two\nlines\"\n1,\"two\nlines\"\n",
+			buffer: 14,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, CRLF, detected",
+			input:  "id,text\r\n0,\"two\r\nlines\"\r\n1,\"two\r\nlines\"\r\n",
+			buffer: 16,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, LF, set",
+			input:  "id,text\n0,\"two\nlines\"\n1,\"two\nlines\"\n",
+			opts:   set,
+			buffer: 14,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, CRLF, set",
+			input:  "id,text\r\n0,\"two\r\nlines\"\r\n1,\"two\r\nlines\"\r\n",
+			opts:   set,
+			buffer: 16,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "two\nlines"}},
+		},
+		{
+			name:   "line break in an enclosure, CR, detected",
+			input:  "id,text\r0,\"two\rlines\"\r1,one\r",
+			buffer: 14,
+			want:   [][]string{{"id", "text"}, {"0", "two\nlines"}, {"1", "one"}},
+		},
+		{
+			name:   "apostrophes before the enclosure on a line, LF, detected",
+			input:  "id,a,b,c,d\n1,'a',\"b\",\"c\",\"d\"\n",
+			buffer: 19,
+			want:   [][]string{{"id", "a", "b", "c", "d"}, {"1", "'a'", "b", "c", "d"}},
+		},
+		{
+			name:   "delimiter and line break in an enclosure, CRLF, detected",
+			input:  "id;text\r\n1;\"a;b\r\nc\"\r\n2;plain\r\n",
+			buffer: 12,
+			want:   [][]string{{"id", "text"}, {"1", "a;b\nc"}, {"2", "plain"}},
+		},
+		// the stray enclosure is told from an open one by the field the next record opens
+		{
+			name:   "stray enclosure, CRLF, set",
+			input:  "id,size\r\n1,55\"\r\n2,\"a,b\r\nc\"\r\n",
+			opts:   set,
+			buffer: 18,
+			want:   [][]string{{"id", "size"}, {"1", `55"`}, {"2", "a,b\nc"}},
+		},
+		{
+			name:   "line break in an enclosed header, CRLF, set",
+			input:  "\"id\",\"te\r\nxt\"\r\n1,2\r\n",
+			opts:   set,
+			buffer: 15,
+			want:   [][]string{{"id", "te xt"}, {"1", "2"}},
+		},
+	}
+
+	readers := []struct {
+		name string
+		wrap func(io.Reader) io.Reader
+	}{
+		{name: "whole", wrap: func(r io.Reader) io.Reader { return r }},
+		{name: "one byte", wrap: iotest.OneByteReader},
+		{name: "half", wrap: iotest.HalfReader},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := append([]Option{WithOrder()}, tt.opts...)
+			for _, rd := range readers {
+				got := readAll(t, NewReader(rd.wrap(strings.NewReader(tt.input)), opts...))
+				if diff := cmp.Diff(tt.want, got); diff != "" {
+					t.Errorf("Read() from a %s reader mismatch (-want +got):\n%s", rd.name, diff)
+				}
+			}
+
+			// the buffer sizes from tt.buffer up end a buffer on every byte of the input
+			for size := tt.buffer; size <= len(tt.input); size++ {
+				got := readAll(t, NewReader(strings.NewReader(tt.input), append(opts, WithBufferSize(size))...))
+				if diff := cmp.Diff(tt.want, got); diff != "" {
+					t.Errorf("Read() with a %d byte buffer mismatch (-want +got):\n%s", size, diff)
+				}
+			}
+		})
+	}
+}
+
 func TestReader_Close_beforeEOF(t *testing.T) {
 	r := NewReader(&endless{}, WithBufferSize(64*1024))
 	for i := 0; i < 1000; i++ {
@@ -415,6 +520,362 @@ func runAll(t *testing.T, r *Reader, workers int) [][]string {
 	}
 
 	return append([][]string{names}, into.records...)
+}
+
+// rowKeeper is a Handler that keeps every record under its row number.
+type rowKeeper struct {
+	mu   *sync.Mutex
+	rows map[uint64][]string
+}
+
+func (k rowKeeper) Record(row uint64, flat []byte, lengths []uint32) error {
+	record := make([]string, len(lengths))
+	for i, n := range lengths {
+		record[i] = string(flat[:n])
+		flat = flat[n:]
+	}
+	k.mu.Lock()
+	k.rows[row] = record
+	k.mu.Unlock()
+	return nil
+}
+
+func (k rowKeeper) Close() error { return nil }
+
+// cutAt returns input from offset from on. With to inside the input it ends
+// there in io.ErrUnexpectedEOF, a stream that broke.
+func cutAt(input string, from int64, to int) io.Reader {
+	if to >= len(input) {
+		return strings.NewReader(input[from:])
+	}
+	return io.MultiReader(strings.NewReader(input[from:to]), iotest.ErrReader(io.ErrUnexpectedEOF))
+}
+
+// stored returns c as a caller gets it back from storage.
+func stored(t *testing.T, c Checkpoint) Checkpoint {
+	t.Helper()
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("json.Marshal(Checkpoint): %s", err)
+	}
+	var decoded Checkpoint
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(Checkpoint): %s", err)
+	}
+	return decoded
+}
+
+func TestReader_Checkpoint(t *testing.T) {
+	// many returns n records, each format filled in with its number
+	many := func(format string, n int) string {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, format, i)
+		}
+		return b.String()
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		opts  []Option
+		// limited is true when the Reader stops before the end of the input
+		limited bool
+	}{
+		{
+			name:  "plain",
+			input: "id,name\n" + many("%d,foo\n", 300),
+			opts:  []Option{WithBufferSize(64)},
+		},
+		{
+			name:  "line break inside an enclosure",
+			input: "id,text\n" + many("%d,\"two\nlines\"\n", 200),
+			opts:  []Option{WithBufferSize(128)},
+		},
+		{
+			name:  "CRLF inside an enclosure",
+			input: "id,text\r\n" + many("%d,\"two\r\nlines\"\r\n", 200),
+			opts:  []Option{WithBufferSize(128)},
+		},
+		{
+			name:  "enclosure first used after plain records",
+			input: "id,text\n" + many("%d,plain\n", 150) + many("%d,\"a,b\"\n", 150),
+			opts:  []Option{WithBufferSize(128)},
+		},
+		{
+			name:  "another quote character after the enclosure",
+			input: "id,text\n" + many("%d,\"a,b\"\n", 150) + many("%d,'c,d'\n", 150),
+			opts:  []Option{WithBufferSize(128)},
+		},
+		{
+			name:  "semicolon, commas in later records",
+			input: "id;text\n" + many("%d;x\n", 150) + many("%d;a,b,c,d\n", 150),
+			opts:  []Option{WithBufferSize(128)},
+		},
+		{
+			name:  "header and records end with a delimiter",
+			input: "id,name,\n" + many("%d,foo,\n", 300),
+			opts:  []Option{WithBufferSize(64)},
+		},
+		{
+			name:  "header ends with a delimiter, records hold a last value",
+			input: "id,name,\n" + many("%d,foo,bar\n", 300),
+			opts:  []Option{WithBufferSize(64)},
+		},
+		{
+			name:  "multi-byte delimiter",
+			input: "id||name\n" + many("%d||foo\n", 300),
+			opts:  []Option{WithBufferSize(64)},
+		},
+		{
+			name:  "newline delimited",
+			input: "id,name\n" + many("%d,\"foo\"\n", 300),
+			opts:  []Option{WithBufferSize(64), WithNewlineDelimited()},
+		},
+		{
+			name:  "excluded column",
+			input: "id,secret,name\n" + many("%d,x,foo\n", 300),
+			opts:  []Option{WithBufferSize(64), WithExclude(1)},
+		},
+		{
+			name:  "excluded column the header does not have",
+			input: "id,secret,name\n" + many("%d,x,foo\n", 300),
+			opts:  []Option{WithBufferSize(64), WithExclude(1, 7)},
+		},
+		{
+			name:  "header on the third line",
+			input: "export 2020\nsheet 1\nid,name\n" + many("%d,foo\n", 300),
+			opts:  []Option{WithBufferSize(64), WithStart(3)},
+		},
+		{
+			name:    "skip and limit",
+			input:   "id,name\n" + many("%d,foo\n", 300),
+			opts:    []Option{WithBufferSize(64), WithSkip(5), WithLimit(250)},
+			limited: true,
+		},
+		{
+			name:  "records without a value",
+			input: "id,name\n" + many("%d,foo\n,\n\n", 200),
+			opts:  []Option{WithBufferSize(64)},
+		},
+		{
+			name:  "full batches in the default buffer",
+			input: "id,name\n" + many("%d,foo\n", 20000),
+		},
+		{
+			name:  "less than one batch in the default buffer",
+			input: "id,name\n" + many("%d,foo\n", 300),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// the stream breaks at each of these offsets in turn, then reads to its end
+			var cuts []int
+			for i := 1; i <= 7; i++ {
+				cuts = append(cuts, len(tt.input)*i/8+i)
+			}
+			cuts = append(cuts, len(tt.input))
+
+			t.Run("Run", func(t *testing.T) {
+				opts := append([]Option{WithWorkers(3)}, tt.opts...)
+
+				var mu sync.Mutex
+				want := make(map[uint64][]string)
+				whole := NewReader(strings.NewReader(tt.input), opts...)
+				wantNames, err := whole.Header()
+				if err != nil {
+					t.Fatalf("Header(): %s", err)
+				}
+				if err := whole.Run(func() (Handler, error) { return rowKeeper{&mu, want}, nil }); err != nil {
+					t.Fatalf("Run(): %s", err)
+				}
+				if kept := whole.Checkpoint(); kept.Offset != 0 || kept.Row != 0 {
+					t.Errorf("Checkpoint() without WithCheckpoints = offset %d row %d, want the zero Checkpoint", kept.Offset, kept.Row)
+				}
+
+				got := make(map[uint64][]string)
+				var checkpoint Checkpoint
+				past := false
+				for _, cut := range cuts {
+					if int64(cut) < checkpoint.Offset {
+						continue
+					}
+					r := NewReader(cutAt(tt.input, checkpoint.Offset, cut), append(opts, WithCheckpoint(checkpoint))...)
+					names, err := r.Header()
+					if err == nil {
+						if diff := cmp.Diff(wantNames, names); diff != "" {
+							t.Fatalf("Header() from offset %d mismatch (-want +got):\n%s", checkpoint.Offset, diff)
+						}
+						rows := make(map[uint64][]string)
+						err = r.Run(func() (Handler, error) { return rowKeeper{&mu, rows}, nil })
+						for row, record := range rows {
+							if had, ok := got[row]; ok && !slices.Equal(had, record) {
+								t.Fatalf("row %d from offset %d = %q, was %q", row, checkpoint.Offset, record, had)
+							}
+							got[row] = record
+						}
+					}
+					// a Reader at its limit does not read up to the break
+					if tt.limited && err == nil {
+						cut = len(tt.input)
+					}
+					if (cut < len(tt.input)) != errors.Is(err, io.ErrUnexpectedEOF) || (cut == len(tt.input) && err != nil) {
+						t.Fatalf("reading up to %d of %d bytes ended in %v", cut, len(tt.input), err)
+					}
+
+					next := stored(t, r.Checkpoint())
+					if next.Offset < checkpoint.Offset || next.Row < checkpoint.Row {
+						t.Fatalf("Checkpoint() = offset %d row %d, before offset %d row %d",
+							next.Offset, next.Row, checkpoint.Offset, checkpoint.Row)
+					}
+					// a caller keeps the rows up to the checkpoint; the rest comes again
+					for row := range got {
+						if cut < len(tt.input) && row > next.Row {
+							delete(got, row)
+						}
+					}
+					checkpoint = next
+					if cut == len(tt.input) {
+						break
+					}
+					if checkpoint.Offset > 0 {
+						past = true
+					}
+				}
+
+				if diff := cmp.Diff(want, got); diff != "" {
+					t.Errorf("rows of the runs together mismatch (-want +got):\n%s", diff)
+				}
+				if !past {
+					t.Errorf("no run started past the start of the input")
+				}
+			})
+
+			t.Run("Read", func(t *testing.T) {
+				opts := append([]Option{WithWorkers(3), WithOrder()}, tt.opts...)
+				want := readAll(t, NewReader(strings.NewReader(tt.input), opts...))
+
+				var got [][]string
+				var checkpoint Checkpoint
+				for _, cut := range cuts {
+					if int64(cut) < checkpoint.Offset {
+						continue
+					}
+					r := NewReader(cutAt(tt.input, checkpoint.Offset, cut), append(opts, WithCheckpoint(checkpoint))...)
+
+					// a caller keeps what it read before the checkpoint moved
+					var kept, read [][]string
+					at := checkpoint
+					var err error
+					for first := true; ; first = false {
+						var record []string
+						record, err = r.ReadStrings()
+						if now := r.Checkpoint(); now.Offset != at.Offset {
+							kept, read, at = append(kept, read...), nil, now
+						}
+						if err != nil {
+							break
+						}
+						// every run returns the header first
+						if first {
+							if diff := cmp.Diff(want[0], record); diff != "" {
+								t.Fatalf("header from offset %d mismatch (-want +got):\n%s", checkpoint.Offset, diff)
+							}
+							continue
+						}
+						read = append(read, record)
+					}
+					r.Close()
+					if tt.limited && err == io.EOF {
+						cut = len(tt.input)
+					}
+					if (cut < len(tt.input)) != errors.Is(err, io.ErrUnexpectedEOF) || (cut == len(tt.input) && err != io.EOF) {
+						t.Fatalf("reading up to %d of %d bytes ended in %v", cut, len(tt.input), err)
+					}
+					if cut == len(tt.input) && len(read) != 0 {
+						t.Fatalf("%d records read after the last checkpoint of input read to its end", len(read))
+					}
+
+					got = append(got, kept...)
+					checkpoint = stored(t, at)
+					if cut == len(tt.input) {
+						break
+					}
+				}
+
+				if diff := cmp.Diff(want[1:], got); diff != "" {
+					t.Errorf("records of the runs together mismatch (-want +got):\n%s", diff)
+				}
+			})
+		})
+	}
+}
+
+func TestProgress_deliver(t *testing.T) {
+	type delivery struct {
+		seq uint64
+		// offset is the offset of the state past the batch, 0 for a batch no Reader starts after
+		offset int64
+		whole  bool
+	}
+	tests := []struct {
+		name       string
+		deliveries []delivery
+		// want is the offset of the state reached, 0 for none
+		want int64
+	}{
+		{
+			name:       "a batch ahead waits for the one before it",
+			deliveries: []delivery{{1, 20, true}},
+			want:       0,
+		},
+		{
+			name:       "batches out of order",
+			deliveries: []delivery{{2, 30, true}, {1, 20, true}, {0, 10, true}},
+			want:       30,
+		},
+		{
+			name:       "a batch not delivered whole stops the batches after it",
+			deliveries: []delivery{{0, 10, true}, {1, 20, false}, {2, 30, true}},
+			want:       10,
+		},
+		{
+			name:       "a batch ahead not delivered whole",
+			deliveries: []delivery{{2, 30, true}, {1, 20, false}, {0, 10, true}},
+			want:       10,
+		},
+		{
+			name:       "a batch no Reader starts after is passed over",
+			deliveries: []delivery{{0, 10, true}, {1, 0, true}, {2, 30, true}},
+			want:       30,
+		},
+		{
+			name:       "the last batch delivered is one no Reader starts after",
+			deliveries: []delivery{{0, 10, true}, {1, 0, true}},
+			want:       10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var p progress
+			// the cutter adds the states in input order, before any batch is delivered
+			cut := append([]delivery(nil), tt.deliveries...)
+			slices.SortFunc(cut, func(a, b delivery) bool { return a.seq < b.seq })
+			for _, d := range cut {
+				if d.offset != 0 {
+					p.add(d.seq, state{offset: d.offset})
+				}
+			}
+			for _, d := range tt.deliveries {
+				p.deliver(d.seq, d.whole)
+			}
+			if p.at.offset != tt.want || p.reached != (tt.want != 0) {
+				t.Errorf("state reached = offset %d (reached %t), want offset %d", p.at.offset, p.reached, tt.want)
+			}
+		})
+	}
 }
 
 // wantRecords reads the records a fixture holds: one JSON array of strings per

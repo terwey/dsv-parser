@@ -6,6 +6,7 @@ package util
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"unicode/utf8"
@@ -109,6 +110,11 @@ type CharacterConfig struct {
 	// prevents re-detection of the EOL
 	FixedEOL bool
 
+	// BufferSize is the most input SplitCsvInput is given at once. Before EOF
+	// and with less input than this, it asks for more when a cut depends on
+	// bytes it has not been given. Zero cuts on the input given.
+	BufferSize int
+
 	// searched is the length of the input, from the start of the data
 	// SplitCsvInput was last given, whose lines were searched for an enclosure
 	// and hold none. It ends after a line break and holds searchedLines lines.
@@ -120,6 +126,91 @@ type CharacterConfig struct {
 	searchedPlain     int
 	searchedEOL       characters.Character
 	searchedDelimiter characters.Character
+}
+
+// characterState is the encoded form of a CharacterConfig: what SplitCsvInput
+// carries from one record to the next.
+type characterState struct {
+	Delimiter        []byte
+	Enclosure        []byte
+	EnclosureIsEmpty bool
+	DoubleEnclosure  []byte
+	EOL              []byte
+	EscapeCharacter  []byte
+	EscapedEnclosure []byte
+	EnclosureClean   bool
+
+	DelimiterCount      int
+	ClearedEOL          bool
+	EOLBuf              []byte
+	Excel               bool
+	PHP                 bool
+	DelimCounted        int
+	DelimOutsideCounted int
+	NdMoved             int
+	ReturnEarly         bool
+	FixedEOL            bool
+}
+
+// MarshalBinary encodes the state SplitCsvInput carries from one record to the
+// next. BufferSize is not part of it.
+func (c CharacterConfig) MarshalBinary() ([]byte, error) {
+	return json.Marshal(characterState{
+		Delimiter:        c.Delimiter,
+		Enclosure:        c.Enclosure,
+		EnclosureIsEmpty: c.EnclosureIsEmpty,
+		DoubleEnclosure:  c.DoubleEnclosure,
+		EOL:              c.EOL,
+		EscapeCharacter:  c.EscapeCharacter,
+		EscapedEnclosure: c.EscapedEnclosure,
+		EnclosureClean:   c.EnclosureClean,
+
+		DelimiterCount:      c.DelimiterCount,
+		ClearedEOL:          c.clearedEOL,
+		EOLBuf:              c.eolBuf,
+		Excel:               c.Excel,
+		PHP:                 c.PHP,
+		DelimCounted:        c.DelimCounted,
+		DelimOutsideCounted: c.DelimOutsideCounted,
+		NdMoved:             c.NdMoved,
+		ReturnEarly:         c.ReturnEarly,
+		FixedEOL:            c.FixedEOL,
+	})
+}
+
+// UnmarshalBinary sets c to the state MarshalBinary encoded: SplitCsvInput
+// then cuts the input after that state as the CharacterConfig it came from
+// would have. BufferSize keeps its value.
+func (c *CharacterConfig) UnmarshalBinary(data []byte) error {
+	var st characterState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return err
+	}
+
+	size := c.BufferSize
+	*c = CharacterConfig{BufferSize: size}
+	// SetEnclosure sets the enclosure length; the fields it derives are overwritten below
+	c.SetEnclosure(st.Enclosure)
+	c.Delimiter = st.Delimiter
+	c.Enclosure = st.Enclosure
+	c.EnclosureIsEmpty = st.EnclosureIsEmpty
+	c.DoubleEnclosure = st.DoubleEnclosure
+	c.EOL = st.EOL
+	c.EscapeCharacter = st.EscapeCharacter
+	c.EscapedEnclosure = st.EscapedEnclosure
+	c.EnclosureClean = st.EnclosureClean
+
+	c.DelimiterCount = st.DelimiterCount
+	c.clearedEOL = st.ClearedEOL
+	c.eolBuf = st.EOLBuf
+	c.Excel = st.Excel
+	c.PHP = st.PHP
+	c.DelimCounted = st.DelimCounted
+	c.DelimOutsideCounted = st.DelimOutsideCounted
+	c.NdMoved = st.NdMoved
+	c.ReturnEarly = st.ReturnEarly
+	c.FixedEOL = st.FixedEOL
+	return nil
 }
 
 func NewCharacterConfig(delimiter, enclosure characters.Character) *CharacterConfig {
@@ -381,6 +472,22 @@ func (c *CharacterConfig) moveSearched(in []byte, advance int) {
 	}
 }
 
+// wait reports whether SplitCsvInput asks for more input than in instead of
+// cutting on in alone.
+func (c *CharacterConfig) wait(in []byte, atEOF bool) bool {
+	return !atEOF && len(in) < c.BufferSize
+}
+
+// findEOL is FindEOLCharacter of in. more is true when wait is and the first
+// line break is a CR that ends in: the byte after it tells CR from CRLF.
+func findEOL(in []byte, wait bool) (eol characters.Character, more bool) {
+	eol = FindEOLCharacter(in)
+	if !wait || !bytes.Equal(eol, characters.Character_CARRIAGE_RETURN) {
+		return eol, false
+	}
+	return eol, bytes.IndexByte(in, characters.Character_CARRIAGE_RETURN[0]) == len(in)-1
+}
+
 func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, token []byte, err error) {
 	if len(in) == 0 && atEOF {
 		return 0, nil, io.EOF
@@ -389,7 +496,11 @@ func (c *CharacterConfig) splitCsvInput(in []byte, atEOF bool) (advance int, tok
 	var eolIndex int
 	// using a for because its nicer to break than have crazy if statements
 	for len(c.EOL) == 0 {
-		c.EOL = FindEOLCharacter(in)
+		var more bool
+		if c.EOL, more = findEOL(in, c.wait(in, atEOF)); more {
+			c.EOL = nil
+			return 0, nil, nil
+		}
 
 		if len(c.EOL) == 0 && len(c.eolBuf) != 0 {
 			c.EOL = c.eolBuf
@@ -440,7 +551,9 @@ findEolIndex:
 
 	if len(c.Enclosure) == 0 && !c.EnclosureIsEmpty {
 		// debug.Debug("c.Enclosure: +%s+ c.EnclosureIsEmpty: %t", c.Enclosure, c.EnclosureIsEmpty)
-		c.detectDelimiterAndEnclosureInChunk(in, eolIndex)
+		if !c.detectDelimiterAndEnclosureInChunk(in, eolIndex, atEOF) && c.wait(in, atEOF) {
+			return 0, nil, nil
+		}
 	}
 
 	if c.ReturnEarly {
@@ -488,12 +601,18 @@ findEolIndex:
 						tmpEolIndex = bytes.Index(in[tmpStart:], c.EOL)
 						// we could be at the end of a file
 						if tmpEolIndex == -1 {
+							if c.wait(in, atEOF) {
+								return 0, nil, nil
+							}
 							tmpEolIndex = len(in)
 							i++
 							continue
 						}
 						tmpEolIndex += tmpStart
 					} else {
+						if c.wait(in, atEOF) {
+							return 0, nil, nil
+						}
 						break
 					}
 					i++
@@ -640,13 +759,18 @@ findEolIndex:
 
 			// a full row with an open enclosure, and the next enclosure encloses a field of its own
 			if eolIndex == firstEolIndex && !c.PHP && c.DelimCounted == c.DelimiterCount &&
-				(enclosureCount-bytes.Count(in[:eolIndex], c.EscapedEnclosure))%2 != 0 &&
-				c.strayEnclosure(in, eolIndex, atEOF) {
-				if debug.DebugLog {
-					debug.LogData("[SplitCsvInput] stray enclosure, the next enclosure encloses a field", in[:eolIndex], 4096)
-					debug.BreakMe()
+				(enclosureCount-bytes.Count(in[:eolIndex], c.EscapedEnclosure))%2 != 0 {
+				stray, known := c.strayEnclosure(in, eolIndex, atEOF)
+				if !known && c.wait(in, atEOF) {
+					return 0, nil, nil
 				}
-				return eolIndex + len(c.EOL), in[:eolIndex], nil
+				if stray {
+					if debug.DebugLog {
+						debug.LogData("[SplitCsvInput] stray enclosure, the next enclosure encloses a field", in[:eolIndex], 4096)
+						debug.BreakMe()
+					}
+					return eolIndex + len(c.EOL), in[:eolIndex], nil
+				}
 			}
 
 			// we cannot compare with the c.DelimCount as that number is ALWAYS higher than c.DelimOutsideCount
@@ -704,7 +828,10 @@ findEolIndex:
 	moveindex:
 		tmpEOL := c.EOL
 		if !c.FixedEOL {
-			tmpEOL = FindEOLCharacter(in[eolIndex+len(c.EOL):])
+			var more bool
+			if tmpEOL, more = findEOL(in[eolIndex+len(c.EOL):], c.wait(in, atEOF)); more {
+				break
+			}
 			if len(tmpEOL) == 0 {
 				tmpEOL = c.EOL
 			}
@@ -768,26 +895,27 @@ func (c *CharacterConfig) countOutside(record []byte, counted *int, counts *scan
 
 // strayEnclosure reports whether the open enclosure on the line ending at eolIndex has no
 // partner: the next enclosure starts a field and the enclosure after it ends that field,
-// or at EOF no enclosure follows. It returns false while in holds too little to tell.
-func (c *CharacterConfig) strayEnclosure(in []byte, eolIndex int, atEOF bool) bool {
+// or at EOF no enclosure follows. known is false while in holds too little to tell; stray
+// is then false.
+func (c *CharacterConfig) strayEnclosure(in []byte, eolIndex int, atEOF bool) (stray, known bool) {
 	if len(in) < eolIndex+len(c.EOL) {
-		return false
+		return false, false
 	}
 	rest := in[eolIndex+len(c.EOL):]
 
 	open := bytes.Index(rest, c.Enclosure)
 	if open == -1 {
-		return atEOF
+		return atEOF, atEOF
 	}
 	if !c.startsField(rest[:open]) {
-		return false
+		return false, true
 	}
 
 	pos := open + len(c.Enclosure)
 	for {
 		i := bytes.Index(rest[pos:], c.Enclosure)
 		if i == -1 {
-			return false
+			return false, atEOF
 		}
 		pos += i + len(c.Enclosure)
 
@@ -798,9 +926,9 @@ func (c *CharacterConfig) strayEnclosure(in []byte, eolIndex int, atEOF bool) bo
 		}
 
 		if pos == len(rest) {
-			return atEOF
+			return atEOF, atEOF
 		}
-		return c.endsField(rest[pos:])
+		return c.endsField(rest[pos:]), true
 	}
 }
 
@@ -833,13 +961,15 @@ func (c *CharacterConfig) endsField(after []byte) bool {
 
 func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
 	cc.searched, cc.searchedLines, cc.searchedPlain = 0, 0, 0
-	cc.detectDelimiterAndEnclosureInChunk(in, eolIndex)
+	cc.detectDelimiterAndEnclosureInChunk(in, eolIndex, true)
 }
 
 // detectDelimiterAndEnclosureInChunk searches the line ending at eolIndex and
 // up to 49 lines after it for an enclosure. A line a call before it searched,
-// counted by searched, is not searched again.
-func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
+// counted by searched, is not searched again. It reports whether it found an
+// enclosure or searched all 50 lines. Before EOF it does not search a last
+// line without its line break: what it holds depends on where in ends.
+func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolIndex int, atEOF bool) bool {
 	if len(cc.Delimiter) == 0 {
 		cc.SetDelimiter(characters.DetectDelimiter(in[:eolIndex]))
 	}
@@ -858,10 +988,10 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 	i := 0
 	for {
 		if i >= tries {
-			break
+			return true
 		}
 		if len(in) < tmpEolIndex {
-			break
+			return false
 		}
 		if tmpEolIndex+len(cc.EOL) > cc.searched {
 			// the search finds no enclosure in a line whose columns start plain
@@ -875,7 +1005,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 						debug.Debug("enclosure (%s) count: %d occurence: %d found in: \n+%s+", encl, enclDetectCount, occurence, in[tmpStart:tmpEolIndex])
 						// panic("yo")
 					}
-					break
+					return true
 				}
 			}
 			if complete && tmpStart == cc.searched {
@@ -895,7 +1025,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			encl, enclDetectCount, _ := characters.DetectEnclosureWithDelimiter(in[0:tmpEolIndex], cc.Delimiter)
 			if enclDetectCount > 0 {
 				cc.SetEnclosure(encl)
-				break
+				return true
 			}
 		}
 		if len(in) > tmpEolIndex+len(cc.EOL) {
@@ -905,13 +1035,16 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 				tmpStart = cc.searched
 				i = cc.searchedLines - 1
 				if tmpStart == len(in) {
-					break
+					return false
 				}
 			}
 			// debug.Debug("searching inside: %s", in[tmpStart:])
 			tmpEolIndex = bytes.Index(in[tmpStart:], cc.EOL)
 			// we could be at the end of a file
 			if tmpEolIndex == -1 {
+				if !atEOF {
+					return false
+				}
 				tmpEolIndex = len(in)
 				complete = false
 				i++
@@ -920,7 +1053,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			tmpEolIndex += tmpStart
 			// debug.Debug("found: %s", in[tmpStart:tmpEolIndex])
 		} else {
-			break
+			return false
 		}
 		i++
 	}

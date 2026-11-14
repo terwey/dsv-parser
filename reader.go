@@ -14,6 +14,7 @@ package dsv
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -80,12 +81,23 @@ type Reader struct {
 	limited bool
 	// a header ending with a delimiter waits for the first row
 	pendingHeader []byte
-	blk           *block
-	off, end      int
-	eof           bool
-	cur           *batch
-	row           uint64
-	seq           uint64
+	// resumed is the header of the checkpoint the Reader started from
+	resumed  *header
+	blk      *block
+	off, end int
+	eof      bool
+	cur      *batch
+	row      uint64
+	seq      uint64
+	// base is the input offset of the first byte of blk
+	base int64
+
+	// checkpoints is set when the Reader keeps checkpoints: without it the
+	// cutter takes no state and the workers report nothing to progress
+	checkpoints bool
+	progress    progress
+	// resume is the checkpoint the Reader started from
+	resume Checkpoint
 
 	blockPool  sync.Pool
 	batchPool  sync.Pool
@@ -151,12 +163,149 @@ type batch struct {
 	seq   uint64
 }
 
+// state is what the cutter carries from one record to the next: a Reader given
+// it reads the input from offset on as the Reader it was taken from did.
+type state struct {
+	cfg             util.CharacterConfig
+	delimSet        bool
+	enclosureSet    bool
+	enclDetectCount int
+	// offset is the input offset of the next record, row the number of the last one
+	offset int64
+	row    uint64
+}
+
 // result is one batch split into fields, for Read.
 type result struct {
 	seq    uint64
 	flat   []byte
 	lens   []uint32
 	fields []uint32
+}
+
+// progress is the state after the last batch delivered with every batch before it.
+type progress struct {
+	mu sync.Mutex
+	// at is that state, set when reached is
+	at      state
+	reached bool
+	// next is the sequence number of the first batch not delivered
+	next uint64
+	// cut holds, from head on and in input order, the state past every batch
+	// from next on that a Reader can start after
+	cut  []cutState
+	head int
+	// ahead holds the batches after next that were delivered, and whether whole
+	ahead map[uint64]bool
+	// stopped is set once a batch was not delivered whole
+	stopped bool
+}
+
+// cutState is the state of the cutter past batch seq.
+type cutState struct {
+	seq   uint64
+	after state
+}
+
+// add keeps the state past batch seq. The cutter calls it before it sends the
+// batch, in input order, for a batch a Reader can start after.
+func (p *progress) add(seq uint64, after state) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return
+	}
+	p.cut = append(p.cut, cutState{seq: seq, after: after})
+}
+
+// deliver records that the records of batch seq were delivered: all of them
+// when whole is true.
+func (p *progress) deliver(seq uint64, whole bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.stopped {
+		return
+	}
+	if seq != p.next {
+		if p.ahead == nil {
+			p.ahead = make(map[uint64]bool)
+		}
+		p.ahead[seq] = whole
+		return
+	}
+
+	for {
+		if !whole {
+			p.stopped = true
+			return
+		}
+		if p.head < len(p.cut) && p.cut[p.head].seq == p.next {
+			p.at, p.reached = p.cut[p.head].after, true
+			p.head++
+			// the states passed make room once they are half of the slice
+			if p.head == len(p.cut) {
+				p.cut, p.head = p.cut[:0], 0
+			} else if p.head >= 16 && 2*p.head >= len(p.cut) {
+				p.cut, p.head = p.cut[:copy(p.cut, p.cut[p.head:])], 0
+			}
+		}
+		p.next++
+		var ok bool
+		if whole, ok = p.ahead[p.next]; !ok {
+			return
+		}
+		delete(p.ahead, p.next)
+	}
+}
+
+// Checkpoint is a place in the input a Reader can start from again. The zero
+// value is the start of the input. It can be stored as JSON.
+type Checkpoint struct {
+	// Offset is the number of bytes of input before the checkpoint. The input of
+	// a Reader given the checkpoint starts with the byte after them.
+	Offset int64
+	// Row is the number of the last record before the checkpoint.
+	Row uint64
+
+	// state is the header and the detection state at Offset, encoded
+	state []byte
+}
+
+// checkpointState is the encoded part of a Checkpoint.
+type checkpointState struct {
+	Names           [][]byte
+	ColCount        int
+	Exclude         []int
+	KeepLastColumn  bool
+	DelimSet        bool
+	EnclosureSet    bool
+	EnclDetectCount int
+	Characters      []byte
+}
+
+// MarshalJSON encodes c with its header and detection state.
+func (c Checkpoint) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Offset int64  `json:"offset"`
+		Row    uint64 `json:"row"`
+		State  []byte `json:"state,omitempty"`
+	}{c.Offset, c.Row, c.state})
+}
+
+// UnmarshalJSON decodes what MarshalJSON encoded.
+func (c *Checkpoint) UnmarshalJSON(data []byte) error {
+	var v struct {
+		Offset int64  `json:"offset"`
+		Row    uint64 `json:"row"`
+		State  []byte `json:"state"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	c.Offset, c.Row, c.state = v.Offset, v.Row, v.State
+	return nil
 }
 
 // Option configures a Reader.
@@ -246,6 +395,30 @@ func WithFixedLineEnding() Option {
 	}
 }
 
+// WithCheckpoints makes the Reader keep checkpoints, for Checkpoint to return.
+// Without it a Reader keeps none and pays nothing for them.
+func WithCheckpoints() Option {
+	return func(r *Reader) {
+		r.checkpoints = true
+	}
+}
+
+// WithCheckpoint starts the Reader at a Checkpoint another Reader returned, and
+// makes it keep checkpoints as WithCheckpoints does. Give it the options that
+// Reader had. The input starts at the checkpoint's Offset and holds no header:
+// Header, and the first Read, return the names the checkpoint carries. Rows are
+// numbered on from the checkpoint's Row. The delimiter, enclosure, line ending
+// and excluded columns are those of the checkpoint; nothing is detected again.
+// WithStart and WithSkip do not apply to the input given, WithLimit counts the
+// rows before the checkpoint too. The zero Checkpoint is the start of the
+// input: the Reader reads it as one without a checkpoint does.
+func WithCheckpoint(c Checkpoint) Option {
+	return func(r *Reader) {
+		r.resume = c
+		r.checkpoints = true
+	}
+}
+
 // WithExclude drops the columns at the given 0-based indices from every record.
 func WithExclude(columns ...int) Option {
 	return func(r *Reader) {
@@ -303,6 +476,7 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 	if r.p.Buffersize < 1 {
 		r.optErr = fmt.Errorf("dsv: buffer size %d is below 1", r.p.Buffersize)
 	}
+	r.p.Characters.BufferSize = r.p.Buffersize
 	if r.p.Characters.Delimiter.Length() > 1 && len(r.p.Characters.Enclosure) == 0 {
 		r.p.Characters.EnclosureIsEmpty = true
 		r.p.NewlineDelimited = true
@@ -322,6 +496,11 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 	}
 
 	r.split = newSplitter(r.p)
+	if r.resume.state != nil {
+		if err := r.restore(); err != nil {
+			r.optErr = err
+		}
+	}
 	r.splitFunc = r.p.Characters.SplitCsvInput
 	if r.p.NewlineDelimited {
 		r.splitFunc = bufio.ScanLines
@@ -355,6 +534,74 @@ func (r *Reader) Header() ([][]byte, error) {
 		return nil, io.EOF
 	}
 	return r.hdr.names, nil
+}
+
+// restore sets the cutter to the state of the checkpoint the Reader was given.
+func (r *Reader) restore() error {
+	var st checkpointState
+	if err := json.Unmarshal(r.resume.state, &st); err != nil {
+		return fmt.Errorf("dsv: checkpoint: %w", err)
+	}
+	if err := r.p.Characters.UnmarshalBinary(st.Characters); err != nil {
+		return fmt.Errorf("dsv: checkpoint: %w", err)
+	}
+	r.p.Characters.BufferSize = r.p.Buffersize
+
+	r.delimSet, r.enclosureSet, r.enclDetectCount = st.DelimSet, st.EnclosureSet, st.EnclDetectCount
+	r.headerRead = true
+	r.startCounter = r.p.Start
+	r.skipped = r.skip
+	r.row = r.resume.Row
+	r.base = r.resume.Offset
+	r.resumed = &header{
+		names:          st.Names,
+		colCount:       st.ColCount,
+		exclude:        st.Exclude,
+		keepLastColumn: st.KeepLastColumn,
+	}
+	return nil
+}
+
+// Checkpoint returns the last place a Reader can start from again with
+// WithCheckpoint: the end of a record that was delivered with every record
+// before it. The Reader keeps checkpoints only when it was given
+// WithCheckpoints or WithCheckpoint; without them Checkpoint returns the zero
+// Checkpoint. A record is delivered when Read returned it and Read was called
+// again, or under Run when Record returned nil for it. Checkpoints lie up to
+// 4096 records or 256 KiB of input apart, so records after the checkpoint can
+// have been delivered as well: a Reader started from it delivers them again,
+// under the same row numbers.
+//
+// Before the first checkpoint is reached it returns the Checkpoint the Reader
+// was given, the zero Checkpoint without one. After an error, an error of the
+// input included, it still returns the last checkpoint reached. Checkpoint is
+// safe to call during Run, not concurrently with Read.
+func (r *Reader) Checkpoint() Checkpoint {
+	r.progress.mu.Lock()
+	defer r.progress.mu.Unlock()
+
+	if !r.progress.reached {
+		return r.resume
+	}
+	at := &r.progress.at
+	cfg, err := at.cfg.MarshalBinary()
+	if err != nil {
+		return r.resume
+	}
+	encoded, err := json.Marshal(checkpointState{
+		Names:           r.hdr.names,
+		ColCount:        r.hdr.colCount,
+		Exclude:         r.hdr.exclude,
+		KeepLastColumn:  r.hdr.keepLastColumn,
+		DelimSet:        at.delimSet,
+		EnclosureSet:    at.enclosureSet,
+		EnclDetectCount: at.enclDetectCount,
+		Characters:      cfg,
+	})
+	if err != nil {
+		return r.resume
+	}
+	return Checkpoint{Offset: at.offset, Row: at.row, state: encoded}
 }
 
 // Characters returns the delimiter, enclosure and line ending the Reader was
@@ -437,6 +684,9 @@ func (r *Reader) Read() ([][]byte, error) {
 			if r.resRec < len(r.res.fields) {
 				return r.nextFields(), nil
 			}
+			if r.checkpoints {
+				r.progress.deliver(r.res.seq, true)
+			}
 			r.resultPool.Put(r.res)
 			r.res = nil
 		}
@@ -474,15 +724,21 @@ func (r *Reader) Close() error {
 	return nil
 }
 
+// fail stops the Reader with err: records not yet delivered are lost.
 func (r *Reader) fail(err error) {
+	r.setErr(err)
+	r.quitOnce.Do(func() {
+		close(r.quit)
+	})
+}
+
+// setErr keeps err as the error Run and Read return, unless one is kept already.
+func (r *Reader) setErr(err error) {
 	r.mu.Lock()
 	if r.err == nil {
 		r.err = err
 	}
 	r.mu.Unlock()
-	r.quitOnce.Do(func() {
-		close(r.quit)
-	})
 }
 
 func (r *Reader) failure() error {
@@ -578,9 +834,15 @@ func (r *Reader) handle(h Handler) {
 				}
 				if err := h.Record(b.first+uint64(i), flat, lens); err != nil {
 					r.fail(err)
+					if r.checkpoints {
+						r.progress.deliver(b.seq, false)
+					}
 					r.putBatch(b)
 					return
 				}
+			}
+			if r.checkpoints {
+				r.progress.deliver(b.seq, true)
 			}
 			r.putBatch(b)
 		}
@@ -698,6 +960,10 @@ func (r *Reader) cut() {
 		r.addRowCount(r.split.RowCounter)
 	}()
 
+	if r.resumed != nil {
+		r.headerCh <- r.resumed
+	}
+
 	r.blk = r.getBlock()
 	for {
 		token, err := r.next()
@@ -706,7 +972,10 @@ func (r *Reader) cut() {
 		}
 		if err != nil {
 			if err != io.EOF {
-				r.fail(err)
+				// the records cut before the error are whole: the workers get them
+				// before Run or Read returns the error
+				r.setErr(err)
+				r.flush(true)
 				return
 			}
 			break
@@ -724,7 +993,7 @@ func (r *Reader) cut() {
 		r.sendHeader(r.split.parseHeader(r.pendingHeader))
 		r.pendingHeader = nil
 	}
-	r.flush()
+	r.flush(true)
 }
 
 // next returns the next record of the input, a slice of the current block.
@@ -759,12 +1028,13 @@ func (r *Reader) next() ([]byte, error) {
 		// a Read into the last bytes of a block gets little, and from some inputs nothing
 		if free == 0 || (r.off > 0 && free < blockTail && free < len(r.blk.buf)/2) {
 			// the records cut so far stay in the old block, the rest of it moves
-			if !r.flush() {
+			if !r.flush(true) {
 				return nil, ErrClosed
 			}
 			blk := r.getBlock()
 			n := copy(blk.buf, r.blk.buf[r.off:r.end])
 			r.releaseBlock(r.blk)
+			r.base += int64(r.off)
 			r.blk, r.off, r.end = blk, 0, n
 		}
 
@@ -808,11 +1078,11 @@ func (r *Reader) sendHeader(names [][]byte) {
 // add appends a row to the current batch. A batch ends when it is full or the
 // detection state changed, so every row is split under the state it was cut in.
 func (r *Reader) add(data []byte, count, outside int) bool {
-	if r.cur != nil && (len(r.cur.recs) == batchRecords || r.cur.size >= batchBytes ||
-		r.cur.cfg.Excel != r.p.Characters.Excel ||
+	// the state now is the one past data, not past the batch: no Reader starts here
+	if r.cur != nil && (r.cur.cfg.Excel != r.p.Characters.Excel ||
 		!bytes.Equal(r.cur.cfg.Enclosure, r.p.Characters.Enclosure) ||
 		!bytes.Equal(r.cur.cfg.Delimiter, r.p.Characters.Delimiter)) {
-		if !r.flush() {
+		if !r.flush(false) {
 			return false
 		}
 	}
@@ -833,14 +1103,30 @@ func (r *Reader) add(data []byte, count, outside int) bool {
 	}
 	r.cur.recs = append(r.cur.recs, record{data: data, count: int32(count), outside: int32(outside)})
 	r.cur.size += len(data)
+	if len(r.cur.recs) == batchRecords || r.cur.size >= batchBytes {
+		return r.flush(true)
+	}
 	return true
 }
 
 // flush sends the current batch to the workers. It returns false when the
-// Reader was closed.
-func (r *Reader) flush() bool {
+// Reader was closed. resumable is true when the cutter has not looked past the
+// last record of the batch for anything but that record's own cut: its state
+// is then the one a Reader starts with after the batch, kept when the Reader
+// keeps checkpoints.
+func (r *Reader) flush(resumable bool) bool {
 	if r.cur == nil {
 		return true
+	}
+	if resumable && r.checkpoints {
+		r.progress.add(r.cur.seq, state{
+			cfg:             *r.p.Characters,
+			delimSet:        r.delimSet,
+			enclosureSet:    r.enclosureSet,
+			enclDetectCount: r.enclDetectCount,
+			offset:          r.base + int64(r.off),
+			row:             r.row,
+		})
 	}
 
 	select {
