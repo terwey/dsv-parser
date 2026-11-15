@@ -29,6 +29,10 @@ import (
 const (
 	defaultBufferSize = 16 * 1024 * 1024
 
+	// firstBlockSize is the size of the blocks the input is read into until a
+	// record does not fit in one.
+	firstBlockSize = 1024 * 1024
+
 	// A worker takes a batch at a time: up to batchRecords records, or fewer
 	// that hold batchBytes together. A small batch costs more to hand over
 	// than to split.
@@ -85,10 +89,13 @@ type Reader struct {
 	resumed  *header
 	blk      *block
 	off, end int
-	eof      bool
-	cur      *batch
-	row      uint64
-	seq      uint64
+	// blockSize is the size of the blocks the cutter takes: it doubles, up to
+	// the buffer size, when one record fills a block
+	blockSize int
+	eof       bool
+	cur       *batch
+	row       uint64
+	seq       uint64
 	// base is the input offset of the first byte of blk
 	base int64
 
@@ -427,8 +434,10 @@ func WithExclude(columns ...int) Option {
 }
 
 // WithBufferSize sets the largest record, in bytes, the Reader accepts. The
-// default is 16 MiB. The input is read into buffers of this size; with records
-// near it a Reader holds up to five buffers per worker.
+// default is 16 MiB. The input is read into blocks of 1 MiB, or of this size
+// when it is smaller; a record that does not fit in a block doubles the size
+// of the blocks from there on. With records near the size of the blocks a
+// Reader holds up to five blocks per worker.
 func WithBufferSize(size int) Option {
 	return func(r *Reader) {
 		r.p.Buffersize = size
@@ -477,6 +486,10 @@ func NewReader(input io.Reader, opts ...Option) *Reader {
 		r.optErr = fmt.Errorf("dsv: buffer size %d is below 1", r.p.Buffersize)
 	}
 	r.p.Characters.BufferSize = r.p.Buffersize
+	r.blockSize = firstBlockSize
+	if r.blockSize > r.p.Buffersize {
+		r.blockSize = r.p.Buffersize
+	}
 	if r.p.Characters.Delimiter.Length() > 1 && len(r.p.Characters.Enclosure) == 0 {
 		r.p.Characters.EnclosureIsEmpty = true
 		r.p.NewlineDelimited = true
@@ -926,8 +939,9 @@ func (r *Reader) work() {
 
 func (r *Reader) getBlock() *block {
 	blk, _ := r.blockPool.Get().(*block)
-	if blk == nil {
-		blk = &block{buf: make([]byte, r.p.Buffersize)}
+	// a block from before the blocks grew is dropped
+	if blk == nil || len(blk.buf) < r.blockSize {
+		blk = &block{buf: make([]byte, r.blockSize)}
 	}
 	atomic.StoreInt32(&blk.refs, 1)
 	return blk
@@ -1022,8 +1036,15 @@ func (r *Reader) next() ([]byte, error) {
 
 		free := len(r.blk.buf) - r.end
 		if free == 0 && r.off == 0 {
-			return nil, fmt.Errorf("record exceeds the %d byte buffer, or the delimiter (%s) or enclosure (%s) is wrong: %w",
-				r.p.Buffersize, r.p.Characters.Delimiter, r.p.Characters.Enclosure, bufio.ErrTooLong)
+			if len(r.blk.buf) >= r.p.Buffersize {
+				return nil, fmt.Errorf("record exceeds the %d byte buffer, or the delimiter (%s) or enclosure (%s) is wrong: %w",
+					r.p.Buffersize, r.p.Characters.Delimiter, r.p.Characters.Enclosure, bufio.ErrTooLong)
+			}
+			// one record fills the block: it moves to a block of twice the size
+			r.blockSize = 2 * len(r.blk.buf)
+			if r.blockSize > r.p.Buffersize {
+				r.blockSize = r.p.Buffersize
+			}
 		}
 		// a Read into the last bytes of a block gets little, and from some inputs nothing
 		if free == 0 || (r.off > 0 && free < blockTail && free < len(r.blk.buf)/2) {

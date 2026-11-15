@@ -215,7 +215,7 @@ err = r.Run(newHandler)
 
 ## How it works
 
-One goroutine reads the input into large buffers and cuts it into records. A record is a slice of its buffer; it is
+One goroutine reads the input into blocks of 1 MiB and cuts it into records. A record is a slice of its block; it is
 not copied. Batches of records go to the workers, which split them into fields and clean the values. That is the one
 copy a record goes through.
 
@@ -227,7 +227,9 @@ picks it up.
 
 - `Close` waits for a read of the input that is in flight. On an input that never returns, it does not return.
 - With `WithOrder()`, records that finish ahead of a slow batch wait in memory until that batch is done.
-- When records come close to the buffer size, a `Reader` holds up to five buffers per worker.
+- A block stays in memory until every record cut from it is handled, so a `Reader` holds a handful of blocks at a
+  time. A record that does not fit in a block doubles the size of the blocks from there on, up to the buffer size.
+  When records come close to the size of the blocks, a `Reader` holds up to five blocks per worker.
 - Records go to the workers in batches of up to 4096 records or 256 KiB. On an input that trickles in, a record can
   wait for its batch to fill.
 - A record with a broken enclosure can split differently from one run to the next: the splitter that repairs

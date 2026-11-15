@@ -366,6 +366,74 @@ func TestRegressionReader_Read_shortReads(t *testing.T) {
 	}
 }
 
+func TestReader_Read_recordLargerThanBlock(t *testing.T) {
+	// long returns a record of two fields, the second size bytes long
+	long := func(id string, size int) string {
+		return id + "," + strings.Repeat("x", size) + "\n"
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		opts  []Option
+		// want holds the length of the second field of every record
+		want    []int
+		wantErr error
+	}{
+		{
+			name:  "one record of three blocks",
+			input: "id,text\n" + long("1", 10) + long("2", 3*firstBlockSize) + long("3", 10),
+			want:  []int{10, 3 * firstBlockSize, 10},
+		},
+		{
+			name:  "every record larger than the one before",
+			input: "id,text\n" + long("1", firstBlockSize) + long("2", 2*firstBlockSize+1) + long("3", 5*firstBlockSize) + long("4", 10),
+			want:  []int{firstBlockSize, 2*firstBlockSize + 1, 5 * firstBlockSize, 10},
+		},
+		{
+			name:  "a record as large as the buffer allows",
+			input: "id,text\n" + long("1", 3*firstBlockSize-3) + long("2", 10),
+			opts:  []Option{WithBufferSize(3 * firstBlockSize)},
+			want:  []int{3*firstBlockSize - 3, 10},
+		},
+		{
+			name:    "a record larger than the buffer allows",
+			input:   "id,text\n" + long("1", 10) + long("2", 3*firstBlockSize) + long("3", 10),
+			opts:    []Option{WithBufferSize(3 * firstBlockSize)},
+			want:    []int{10},
+			wantErr: bufio.ErrTooLong,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewReader(strings.NewReader(tt.input), append([]Option{WithOrder(), WithWorkers(2)}, tt.opts...)...)
+			defer r.Close()
+
+			var got []int
+			var err error
+			for first := true; ; first = false {
+				var record [][]byte
+				if record, err = r.Read(); err != nil {
+					break
+				}
+				if !first {
+					got = append(got, len(record[1]))
+				}
+			}
+			if err == io.EOF {
+				err = nil
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Read() ended in %v, want %v", err, tt.wantErr)
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("lengths of the second fields mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestReader_Close_beforeEOF(t *testing.T) {
 	r := NewReader(&endless{}, WithBufferSize(64*1024))
 	for i := 0; i < 1000; i++ {

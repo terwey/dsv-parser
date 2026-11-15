@@ -110,10 +110,9 @@ func detectEnclosureWithDelimiter(data []byte, delimiter Character) (Character, 
 	var jsonChecked, jsonEscaped bool
 loop:
 	for i := range cols {
+		// every column starts its search with one byte, whatever the column before it ended on
+		charSize = 1
 		if len(cols[i]) == 0 {
-			continue
-		}
-		if len(cols[i]) < charSize {
 			continue
 		}
 		for {
@@ -243,8 +242,6 @@ loop:
 				prevLeftKnown = left
 			}
 		}
-
-		charSize = 1
 	}
 
 	if debug.DebugLog {
