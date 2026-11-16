@@ -218,7 +218,11 @@ loop:
 				replaced := bytes.ReplaceAll(data, doubleLeft, []byte("DOUBLE_QUOTE"))
 				count := bytes.Count(replaced, left)
 				if count == 0 {
-					continue
+					// every quotation mark of data belongs to a column that is an enclosed empty value
+					if !bytes.Equal(left, Character_QUOTATION_MARK) || bytes.Count(data, left) != 2*countEqual(cols, doubleLeft) {
+						continue
+					}
+					count = bytes.Count(data, left)
 				}
 				escapedCount := bytes.Count(replaced, []byte("DOUBLE_QUOTE"))
 				f = &Found{
@@ -354,6 +358,17 @@ loop:
 	}
 
 	return append(Character{}, highest.char...), highest.count, highest.occurence
+}
+
+// countEqual returns the number of columns that equal value.
+func countEqual(cols [][]byte, value []byte) int {
+	n := 0
+	for _, col := range cols {
+		if bytes.Equal(col, value) {
+			n++
+		}
+	}
+	return n
 }
 
 func findLeftOfPos(data []byte, pos int, charSize int) ([]byte, int, int) {
