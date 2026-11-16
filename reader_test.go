@@ -65,6 +65,16 @@ func TestReader_Read(t *testing.T) {
 			want:  [][]string{{"id", "text"}, {"1", `say "hi"`}},
 		},
 		{
+			name:  "every enclosed value is empty",
+			input: "id,text\n1,\"\"\n2,\"\"\n3,x\n",
+			want:  [][]string{{"id", "text"}, {"1", ""}, {"2", ""}, {"3", "x"}},
+		},
+		{
+			name:  "two asterisks are a value",
+			input: "id,text\n1,**\n2,**\n",
+			want:  [][]string{{"id", "text"}, {"1", "**"}, {"2", "**"}},
+		},
+		{
 			name:  "byte order mark and unnamed column",
 			input: "\xEF\xBB\xBFid;;name\n1;2;3\n",
 			want:  [][]string{{"id", "empty_column", "name"}, {"1", "2", "3"}},
