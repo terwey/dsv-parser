@@ -86,6 +86,9 @@ type CharacterConfig struct {
 	clearedEOL bool
 	eolBuf     characters.Character
 
+	// cut counts the records SplitCsvInput has returned
+	cut int
+
 	// signifies the file was produced by Excel
 	// or behaves like Excel.
 	// meaning the EOL contains an unused delimiter
@@ -150,6 +153,7 @@ type characterState struct {
 	NdMoved             int
 	ReturnEarly         bool
 	FixedEOL            bool
+	Cut                 int
 }
 
 // MarshalBinary encodes the state SplitCsvInput carries from one record to the
@@ -175,6 +179,7 @@ func (c CharacterConfig) MarshalBinary() ([]byte, error) {
 		NdMoved:             c.NdMoved,
 		ReturnEarly:         c.ReturnEarly,
 		FixedEOL:            c.FixedEOL,
+		Cut:                 c.cut,
 	})
 }
 
@@ -210,6 +215,7 @@ func (c *CharacterConfig) UnmarshalBinary(data []byte) error {
 	c.NdMoved = st.NdMoved
 	c.ReturnEarly = st.ReturnEarly
 	c.FixedEOL = st.FixedEOL
+	c.cut = st.Cut
 	return nil
 }
 
@@ -447,6 +453,9 @@ func FindEOLCharacter(in []byte) characters.Character {
 // call must be given the data that follows what the previous call advanced over.
 func (c *CharacterConfig) SplitCsvInput(in []byte, atEOF bool) (advance int, token []byte, err error) {
 	advance, token, err = c.splitCsvInput(in, atEOF)
+	if advance != 0 {
+		c.cut++
+	}
 	c.moveSearched(in, advance)
 	return advance, token, err
 }
@@ -550,6 +559,10 @@ findEolIndex:
 	}
 
 	if len(c.Enclosure) == 0 && !c.EnclosureIsEmpty {
+		if !c.ReturnEarly && c.searchFor(in[:eolIndex], 0) == searchNothing {
+			c.DelimCounted = c.DelimiterCount
+			return eolIndex + len(c.EOL), in[:eolIndex], nil
+		}
 		// debug.Debug("c.Enclosure: +%s+ c.EnclosureIsEmpty: %t", c.Enclosure, c.EnclosureIsEmpty)
 		if !c.detectDelimiterAndEnclosureInChunk(in, eolIndex, atEOF) && c.wait(in, atEOF) {
 			return 0, nil, nil
@@ -935,6 +948,53 @@ func (c *CharacterConfig) endsField(after []byte) bool {
 	return bytes.HasPrefix(after, c.Delimiter) || after[0] == '\n' || after[0] == '\r'
 }
 
+// enclosureWindow is the number of lines, from the first record on, in which
+// every character can be found as the enclosure.
+const enclosureWindow = 50
+
+// search is what a line is searched for while no enclosure is known.
+type search int
+
+const (
+	// searchAny finds every character that encloses a column
+	searchAny search = iota
+	// searchQuotationMark finds the quotation mark only
+	searchQuotationMark
+	// searchNothing takes the line as a record without an enclosure
+	searchNothing
+)
+
+// searchFor returns what line is searched for, line being the one ahead lines
+// after the record SplitCsvInput returns next. Past the enclosureWindow a line
+// with the header's count of delimiters is a record as it is: a column of it
+// that starts and ends with the same character is a value, unless that
+// character is the quotation mark.
+func (cc *CharacterConfig) searchFor(line []byte, ahead int) search {
+	if cc.DelimiterCount == 0 || cc.cut+ahead < enclosureWindow {
+		return searchAny
+	}
+	if bytes.Count(line, cc.Delimiter) != cc.DelimiterCount {
+		return searchAny
+	}
+	if bytes.IndexByte(line, characters.Character_QUOTATION_MARK[0]) != -1 {
+		return searchQuotationMark
+	}
+	return searchNothing
+}
+
+// detectEnclosure is characters.DetectEnclosureWithDelimiter of data, limited
+// to what it is searched for.
+func (cc *CharacterConfig) detectEnclosure(data []byte, searched search) (characters.Character, int, int) {
+	if searched == searchNothing {
+		return nil, 0, 0
+	}
+	encl, count, occurence := characters.DetectEnclosureWithDelimiter(data, cc.Delimiter)
+	if searched == searchQuotationMark && count > 0 && encl[0] != characters.Character_QUOTATION_MARK[0] {
+		return nil, 0, 0
+	}
+	return encl, count, occurence
+}
+
 func (cc *CharacterConfig) DetectDelimiterAndEnclosureInChunk(in []byte, eolIndex int) {
 	cc.searched, cc.searchedLines, cc.searchedPlain = 0, 0, 0
 	cc.detectDelimiterAndEnclosureInChunk(in, eolIndex, true)
@@ -974,7 +1034,7 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			plain := len(cc.Delimiter) == 1 && scan.PlainStarts(in[tmpStart:tmpEolIndex], cc.Delimiter[0])
 			if !plain {
 				// debug.Debug("passing data: %s", in[tmpStart:tmpEolIndex])
-				encl, enclDetectCount, occurence := characters.DetectEnclosureWithDelimiter(in[tmpStart:tmpEolIndex], cc.Delimiter)
+				encl, enclDetectCount, occurence := cc.detectEnclosure(in[tmpStart:tmpEolIndex], cc.searchFor(in[tmpStart:tmpEolIndex], i))
 				if enclDetectCount > 0 {
 					cc.SetEnclosure(encl)
 					if debug.DebugLog {
@@ -998,7 +1058,12 @@ func (cc *CharacterConfig) detectDelimiterAndEnclosureInChunk(in []byte, eolInde
 			if debug.DebugLog {
 				debug.Debug("check enclosure on second line")
 			}
-			encl, enclDetectCount, _ := characters.DetectEnclosureWithDelimiter(in[0:tmpEolIndex], cc.Delimiter)
+			// the two lines joined are searched for the most either of them is searched for
+			searched := cc.searchFor(in[:eolIndex], 0)
+			if second := cc.searchFor(in[tmpStart:tmpEolIndex], 1); second < searched {
+				searched = second
+			}
+			encl, enclDetectCount, _ := cc.detectEnclosure(in[0:tmpEolIndex], searched)
 			if enclDetectCount > 0 {
 				cc.SetEnclosure(encl)
 				return true

@@ -223,6 +223,11 @@ Detection can change while a file is read: a quote first shows up at row 200, or
 export. Every batch is split under the detection state it was cut under, so a row does not depend on which worker
 picks it up.
 
+While no enclosure is known, any character that wraps a column is taken for the enclosure in the first 50 lines.
+After those, a line with as many delimiters as the header is searched for the quotation mark only: a column such as
+`_sulfites_` or `'water, malt'` is a value there. A line with another number of delimiters is still searched for
+every character.
+
 ## Limits
 
 - `Close` waits for a read of the input that is in flight. On an input that never returns, it does not return.
@@ -234,6 +239,8 @@ picks it up.
   wait for its batch to fill.
 - A record with a broken enclosure can split differently from one run to the next: the splitter that repairs
   unescaped delimiters keeps state between the records of one worker.
+- In a file without an enclosure, a column wrapped in one character within the first 50 lines, or in quotation marks
+  on any line, makes that character the enclosure from there on. Pass an empty `WithEnclosure` for such a file.
 - The record cutter panics with `stuck on chunking` when it cannot find the end of a record after 100 attempts, and
   delimiter detection writes one line through `log` when it finds no delimiter and falls back to a comma.
 
@@ -267,8 +274,8 @@ The options are what the caller tells the `Reader` about the rows:
 | `NewlineDelimited` | `WithNewlineDelimited()`. |
 
 `NoEnclosure/AutoDetect` is slower than the other three `NoEnclosure` cases. As long as no enclosure is known the
-parser looks for one in every record, because a quote can first show up at row 200. A file without any pays for that
-search on every record. Each of the other three cases switches the search off.
+parser counts the delimiters of every record and looks for a quotation mark in it, because a quote can first show up
+at row 200. Each of the other three cases switches that off.
 
 ### On one CPU
 
@@ -339,6 +346,11 @@ go test -race .
 ```
 
 `tests/` holds real-world files and, next to each, the records the parser returns for it as JSON lines.
+
+`tests/openfoodfacts-alcohol.tsv` holds 71 products of the [Open Food Facts](https://world.openfoodfacts.org) export.
+The database is available under the [Open Database License](https://opendatacommons.org/licenses/odbl/1-0/), its
+contents under the [Database Contents License](https://opendatacommons.org/licenses/dbcl/1-0/). The file and the
+`.jsonl` next to it stay under those licenses.
 
 The `debug` build tag switches on the tracing in `internal/debug`. Without it the tracing compiles to nothing.
 
