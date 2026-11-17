@@ -42,6 +42,15 @@ func readAll(t *testing.T, r *Reader) [][]string {
 	}
 }
 
+// repeatRecord returns header followed by n times record.
+func repeatRecord(n int, header, record []string) [][]string {
+	records := [][]string{header}
+	for i := 0; i < n; i++ {
+		records = append(records, record)
+	}
+	return records
+}
+
 func TestReader_Read(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -169,6 +178,53 @@ func TestReader_Read(t *testing.T) {
 			input: "\"a\",\"b\"\r\n\"1\",\"x\r\ny\"\n\"3\",\"4\"\n\"5\",\"6\"\n",
 			opts:  []Option{WithFixedLineEnding()},
 			want:  [][]string{{"a", "b"}, {"1", "x\ny\"\n\"3", "4\"\n\"5", "\"6\"\n"}},
+		},
+		{
+			name: "quotation mark first appears after the first 50 lines",
+			input: "a,b,c\n" + strings.Repeat("1,plain_text,2\n", 120) +
+				"3,\"say \"\"hi\"\"\",4\n5,\"quoted\",6\n7,\"a,b\",8\n9,\"two\nlines\",10\n",
+			want: append(repeatRecord(120, []string{"a", "b", "c"}, []string{"1", "plain_text", "2"}),
+				[]string{"3", `say "hi"`, "4"}, []string{"5", "quoted", "6"}, []string{"7", "a,b", "8"},
+				[]string{"9", "two\nlines", "10"}),
+		},
+		{
+			name: "column inside underscores after the first 50 lines is a value",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 60) +
+				"2\t_sulfites_\tz\n3\tsnake_case\tz\n4\tp\tq\n5\tother_name\tq\n6\tr\ts\n",
+			want: append(repeatRecord(60, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "_sulfites_", "z"}, []string{"3", "snake_case", "z"}, []string{"4", "p", "q"},
+				[]string{"5", "other_name", "q"}, []string{"6", "r", "s"}),
+		},
+		{
+			name:  "column inside underscores on line 50 after the header is enclosed",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 49) + "2\t_sulfites_\tz\n3\tp\tq\n",
+			want: append(repeatRecord(49, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "sulfites", "z"}, []string{"3", "p", "q"}),
+		},
+		{
+			name:  "column inside underscores on line 51 after the header is a value",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 50) + "2\t_sulfites_\tz\n3\tp\tq\n",
+			want: append(repeatRecord(50, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "_sulfites_", "z"}, []string{"3", "p", "q"}),
+		},
+		{
+			name:  "quotation mark is found next to a column inside underscores",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 120) + "2\t_x_\t\"q\"\n3\tp\tq\n",
+			want: append(repeatRecord(120, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "_x_", "q"}, []string{"3", "p", "q"}),
+		},
+		{
+			name: "column inside apostrophes after the first 50 lines is a value",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 60) +
+				"2\t'Wasser, Gerstenmalz, Hopfen'\tz\n3\tp\tq\n",
+			want: append(repeatRecord(60, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "'Wasser, Gerstenmalz, Hopfen'", "z"}, []string{"3", "p", "q"}),
+		},
+		{
+			name:  "apostrophe first appears after the first 50 lines, around a delimiter",
+			input: "a,b,c\n" + strings.Repeat("1,x,y\n", 60) + "2,'p,q',z\n3,'r',s\n",
+			want: append(repeatRecord(60, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "p,q", "z"}, []string{"3", "r", "s"}),
 		},
 		{
 			name:  "empty input",
@@ -686,6 +742,11 @@ func TestReader_Checkpoint(t *testing.T) {
 			opts:  []Option{WithBufferSize(128)},
 		},
 		{
+			name:  "column inside underscores after plain records",
+			input: "id\ttext\ttag\n" + many("%d\tx\ty\n", 150) + many("%d\t_sulfites_\tz\n", 150),
+			opts:  []Option{WithBufferSize(128)},
+		},
+		{
 			name:  "semicolon, commas in later records",
 			input: "id;text\n" + many("%d;x\n", 150) + many("%d;a,b,c,d\n", 150),
 			opts:  []Option{WithBufferSize(128)},
@@ -987,6 +1048,11 @@ func TestReader_fixtures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tsv, err := filepath.Glob("tests/*.tsv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths = append(paths, tsv...)
 	if len(paths) == 0 {
 		t.Fatal("no fixtures in tests")
 	}
@@ -1177,7 +1243,7 @@ func readerCases() []readerCase {
 		{name: "EnclosedOneLine/EnclosureSetNewlineDelimited", form: enclosedOneLine, opts: []Option{WithDelimiter(comma), WithEnclosure(quote), WithNewlineDelimited()}},
 
 		// no enclosure in the rows
-		// AutoDetect never finds an enclosure, so every record is searched for one
+		// AutoDetect never finds an enclosure, so every record is checked for a quotation mark
 		{name: "NoEnclosure/AutoDetect", form: plain},
 		{name: "NoEnclosure/EnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(quote)}},
 		{name: "NoEnclosure/NoEnclosureSet", form: plain, opts: []Option{WithDelimiter(comma), WithEnclosure(nil)}},
