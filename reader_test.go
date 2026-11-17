@@ -196,6 +196,24 @@ func TestReader_Read(t *testing.T) {
 				[]string{"5", "other_name", "q"}, []string{"6", "r", "s"}),
 		},
 		{
+			name:  "column inside underscores on line 50 after the header is enclosed",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 49) + "2\t_sulfites_\tz\n3\tp\tq\n",
+			want: append(repeatRecord(49, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "sulfites", "z"}, []string{"3", "p", "q"}),
+		},
+		{
+			name:  "column inside underscores on line 51 after the header is a value",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 50) + "2\t_sulfites_\tz\n3\tp\tq\n",
+			want: append(repeatRecord(50, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "_sulfites_", "z"}, []string{"3", "p", "q"}),
+		},
+		{
+			name:  "quotation mark is found next to a column inside underscores",
+			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 120) + "2\t_x_\t\"q\"\n3\tp\tq\n",
+			want: append(repeatRecord(120, []string{"a", "b", "c"}, []string{"1", "x", "y"}),
+				[]string{"2", "_x_", "q"}, []string{"3", "p", "q"}),
+		},
+		{
 			name: "column inside apostrophes after the first 50 lines is a value",
 			input: "a\tb\tc\n" + strings.Repeat("1\tx\ty\n", 60) +
 				"2\t'Wasser, Gerstenmalz, Hopfen'\tz\n3\tp\tq\n",

@@ -223,9 +223,9 @@ Detection can change while a file is read: a quote first shows up at row 200, or
 export. Every batch is split under the detection state it was cut under, so a row does not depend on which worker
 picks it up.
 
-While no enclosure is known, any character that wraps a column is taken for the enclosure in the first 50 lines.
-After those, a line with as many delimiters as the header is searched for the quotation mark only: a column such as
-`_sulfites_` or `'water, malt'` is a value there. A line with another number of delimiters is still searched for
+While no enclosure is known, any character that wraps a column is taken for the enclosure in the header and the 50
+lines after it. After those, a line with as many delimiters as the header is searched for the quotation mark only: a
+column such as `_sulfites_` or `'malt'` is a value there. A line with another number of delimiters is still searched for
 every character.
 
 ## Limits
@@ -239,8 +239,8 @@ every character.
   wait for its batch to fill.
 - A record with a broken enclosure can split differently from one run to the next: the splitter that repairs
   unescaped delimiters keeps state between the records of one worker.
-- In a file without an enclosure, a column wrapped in one character within the first 50 lines, or in quotation marks
-  on any line, makes that character the enclosure from there on. Pass an empty `WithEnclosure` for such a file.
+- In a file without an enclosure, a column wrapped in one character within the 50 lines after the header, or in
+  quotation marks on any line, makes that character the enclosure from there on. Pass an empty `WithEnclosure` for such a file.
 - The record cutter panics with `stuck on chunking` when it cannot find the end of a record after 100 attempts, and
   delimiter detection writes one line through `log` when it finds no delimiter and falls back to a comma.
 

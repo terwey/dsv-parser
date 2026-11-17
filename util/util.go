@@ -948,8 +948,8 @@ func (c *CharacterConfig) endsField(after []byte) bool {
 	return bytes.HasPrefix(after, c.Delimiter) || after[0] == '\n' || after[0] == '\r'
 }
 
-// enclosureWindow is the number of lines, from the first record on, in which
-// every character can be found as the enclosure.
+// enclosureWindow is the number of lines after the header in which every
+// character can be found as the enclosure.
 const enclosureWindow = 50
 
 // search is what a line is searched for while no enclosure is known.
